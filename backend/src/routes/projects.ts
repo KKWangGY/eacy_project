@@ -1100,6 +1100,16 @@ function stripProjectFieldPathIndices(rawPath: string): string {
     .join('/')
 }
 
+class ProjectFieldScopeResolutionError extends Error {
+  paths: string[]
+
+  constructor(paths: string[]) {
+    super('无法定位可重复字段实例，请刷新后重试')
+    this.name = 'ProjectFieldScopeResolutionError'
+    this.paths = paths
+  }
+}
+
 function resolveProjectFieldScope(instanceId: string, rawPath: string): {
   sectionInstanceId: string | null
   rowInstanceId: string | null
@@ -1669,6 +1679,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
     const updatedAt = new Date().toISOString()
     let changedCount = 0
+    const unresolvedScopePaths: string[] = []
 
     const saveAll = db.transaction(() => {
       for (const field of fields) {
@@ -1680,7 +1691,10 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
         const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
         const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
         const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
+        if (!scope.resolved) {
+          unresolvedScopePaths.push(requestedFieldPath)
+          continue
+        }
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
@@ -1749,6 +1763,10 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       db.prepare(`
         UPDATE schema_instances SET updated_at = ? WHERE id = ?
       `).run(updatedAt, instanceId)
+
+      if (unresolvedScopePaths.length > 0) {
+        throw new ProjectFieldScopeResolutionError(unresolvedScopePaths)
+      }
     })
 
     saveAll()
@@ -1760,6 +1778,14 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       data: { changed_fields: changedCount, total_fields: fields.length },
     })
   } catch (err: any) {
+    if (err instanceof ProjectFieldScopeResolutionError) {
+      return res.status(409).json({
+        success: false,
+        code: 40901,
+        message: err.message,
+        data: { unresolved_paths: err.paths },
+      })
+    }
     console.error('[PATCH crf/fields]', err)
     return res.status(500).json({ success: false, code: 500, message: err?.message || '服务器错误', data: null })
   }
