@@ -108,6 +108,16 @@ interface ResolvedScope {
   resolved: boolean
 }
 
+class ScopeResolutionError extends Error {
+  paths: string[]
+
+  constructor(paths: string[]) {
+    super('无法定位可重复字段实例，请刷新后重试')
+    this.name = 'ScopeResolutionError'
+    this.paths = paths
+  }
+}
+
 /**
  * 根据请求路径中的索引段，定位唯一的 (section_instance_id, row_instance_id)。
  *
@@ -527,12 +537,16 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
 
     let changedCount = 0
     let totalCount = 0
+    const unresolvedScopePaths: string[] = []
 
     const saveAll = db.transaction(() => {
       for (const field of flatFields) {
         totalCount++
         const scope = resolveScopeFromPath(instance.id, field.requestedPath)
-        if (!scope.resolved) continue
+        if (!scope.resolved) {
+          unresolvedScopePaths.push(field.requestedPath)
+          continue
+        }
 
         const oldRow = db.prepare(`
           SELECT selected_value_json FROM field_value_selected
@@ -595,6 +609,10 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
           upsertSelected.run(selectedId, instance.id, field.storagePath, candidateId, field.valueJson)
         }
       }
+
+      if (unresolvedScopePaths.length > 0) {
+        throw new ScopeResolutionError(unresolvedScopePaths)
+      }
     })
 
     saveAll()
@@ -606,6 +624,14 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
       data: { total_fields: totalCount, changed_fields: changedCount }
     })
   } catch (err: any) {
+    if (err instanceof ScopeResolutionError) {
+      return res.status(409).json({
+        success: false,
+        code: 40901,
+        message: err.message,
+        data: { unresolved_paths: err.paths }
+      })
+    }
     console.error('[PUT ehr-schema-data]', err)
     return res.status(500).json({
       success: false,
