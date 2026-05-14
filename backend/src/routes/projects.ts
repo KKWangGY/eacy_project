@@ -1980,8 +1980,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
-
     const stmtDocs = db.prepare(`
       SELECT id
       FROM documents
@@ -1994,6 +1992,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     const submittedDocumentIds: string[] = []
     const submittedPatientIds: string[] = []
     const skippedPatients: any[] = []
+    let clearedHistory = { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     for (const patientId of targetPatients) {
       const docRows = stmtDocs.all(patientId) as any[]
@@ -2052,6 +2051,14 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedPatientIds.push(patientId)
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
+    }
+
+    if (submittedJobIds.length > 0) {
+      /**
+       * 仅在 CRF 服务已成功接收至少一个抽取 job 后清空旧项目 CRF 数据。
+       * 避免服务不可用、提交失败或全员无可运行任务时先删库再返回错误，造成不可逆历史丢失。
+       */
+      clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
     }
 
     db.prepare(`
