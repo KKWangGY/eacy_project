@@ -1980,7 +1980,16 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
+    /**
+     * 项目抽取是异步任务，启动接口只能确认任务已提交，不能确认新结果已成功物化。
+     * 因此不能在这里删除既有 CRF 实例/候选/已选值；否则 CRF 服务提交失败、无新任务、
+     * 或后续异步任务失败都会造成已抽取数据丢失。新结果完成后由物化层覆盖对应字段。
+     */
+    const clearedHistory = {
+      cleared_patient_count: 0,
+      cleared_instance_count: 0,
+      preserved_existing_history: true,
+    }
 
     const stmtDocs = db.prepare(`
       SELECT id
