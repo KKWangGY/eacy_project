@@ -1980,8 +1980,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
-
     const stmtDocs = db.prepare(`
       SELECT id
       FROM documents
@@ -1994,6 +1992,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     const submittedDocumentIds: string[] = []
     const submittedPatientIds: string[] = []
     const skippedPatients: any[] = []
+    const clearedHistory = { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     for (const patientId of targetPatients) {
       const docRows = stmtDocs.all(patientId) as any[]
@@ -2048,6 +2047,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
         skippedPatients.push({ patient_id: patientId, reason: 'no_new_jobs' })
         continue
       }
+
+      const patientClearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, [patientId])
+      clearedHistory.cleared_patient_count += patientClearedHistory.cleared_patient_count
+      clearedHistory.cleared_instance_count += patientClearedHistory.cleared_instance_count
 
       submittedPatientIds.push(patientId)
       submittedJobIds.push(...jobIds)

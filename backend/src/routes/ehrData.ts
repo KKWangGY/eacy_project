@@ -805,7 +805,11 @@ router.post('/:patientId/merge-ehr', (req: Request, res: Response) => {
     }
 
     // 1. 获取文档的 extract_result_json
-    const doc = db.prepare(`SELECT extract_result_json FROM documents WHERE id = ?`).get(document_id) as any
+    const doc = db.prepare(`
+      SELECT extract_result_json
+      FROM documents
+      WHERE id = ? AND patient_id = ?
+    `).get(document_id, patientId) as any
     if (!doc?.extract_result_json) {
       return res.status(400).json({
         success: false, code: 400,
