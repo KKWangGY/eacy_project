@@ -5,6 +5,14 @@ import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
 
 const router = Router()
 
+type CrfFieldInput = {
+  field_path?: unknown
+  path?: unknown
+  group_id?: unknown
+  field_key?: unknown
+  value?: unknown
+}
+
 function nowIso() {
   return new Date().toISOString()
 }
@@ -1606,7 +1614,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     }
 
     const body = req.body
-    const fields = Array.isArray(body?.fields) ? body.fields : []
+    const fields: CrfFieldInput[] = Array.isArray(body?.fields) ? body.fields : []
     if (fields.length === 0) {
       return res.json({ success: true, code: 0, message: '没有需要保存的字段', data: { changed_fields: 0 } })
     }
