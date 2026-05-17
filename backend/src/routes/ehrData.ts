@@ -525,14 +525,32 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     `)
 
+    const scopedFields = flatFields.map((field) => ({
+      ...field,
+      scope: resolveScopeFromPath(instance.id, field.requestedPath),
+    }))
+    const unresolvedFields = scopedFields.filter((field) => !field.scope.resolved)
+    if (unresolvedFields.length > 0) {
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '部分重复字段无法定位，未保存任何字段',
+        data: {
+          unresolved_fields: unresolvedFields.map((field) => ({
+            requested_path: field.requestedPath,
+            storage_path: field.storagePath,
+          })),
+        },
+      })
+    }
+
     let changedCount = 0
     let totalCount = 0
 
     const saveAll = db.transaction(() => {
-      for (const field of flatFields) {
+      for (const field of scopedFields) {
         totalCount++
-        const scope = resolveScopeFromPath(instance.id, field.requestedPath)
-        if (!scope.resolved) continue
+        const { scope } = field
 
         const oldRow = db.prepare(`
           SELECT selected_value_json FROM field_value_selected
