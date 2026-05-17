@@ -1618,16 +1618,8 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       ORDER BY updated_at DESC LIMIT 1
     `).get(patientId, project.schema_id, projectId) as { id: string } | undefined
 
-    let instanceId: string
-    if (!instance) {
-      instanceId = randomUUID()
-      db.prepare(`
-        INSERT INTO schema_instances (id, patient_id, schema_id, project_id, name, instance_type, status)
-        VALUES (?, ?, ?, ?, ?, 'project_crf', 'draft')
-      `).run(instanceId, patientId, project.schema_id, projectId, `${project.schema_id} / ${projectId} / ${patientId}`)
-    } else {
-      instanceId = instance.id
-    }
+    const instanceId = instance?.id || randomUUID()
+    const shouldCreateInstance = !instance
 
     const upsertSelected = db.prepare(`
       INSERT INTO field_value_selected
@@ -1668,19 +1660,48 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     `)
 
     const updatedAt = new Date().toISOString()
+    const scopedFields = fields.flatMap((field) => {
+      const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+      const groupId = String(field?.group_id || '').trim()
+      const fieldKey = String(field?.field_key || '').trim()
+      if (!explicitFieldPath && (!groupId || !fieldKey)) return []
+
+      const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+      const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
+      return [{
+        field,
+        requestedFieldPath,
+        fieldPath,
+        scope: resolveProjectFieldScope(instanceId, requestedFieldPath),
+      }]
+    })
+    const unresolvedFields = scopedFields.filter((field) => !field.scope.resolved)
+    if (unresolvedFields.length > 0) {
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '部分重复字段无法定位，未保存任何字段',
+        data: {
+          unresolved_fields: unresolvedFields.map((field) => ({
+            requested_path: field.requestedFieldPath,
+            storage_path: field.fieldPath,
+          })),
+        },
+      })
+    }
+
     let changedCount = 0
 
     const saveAll = db.transaction(() => {
-      for (const field of fields) {
-        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
-        const groupId = String(field?.group_id || '').trim()
-        const fieldKey = String(field?.field_key || '').trim()
-        if (!explicitFieldPath && (!groupId || !fieldKey)) continue
+      if (shouldCreateInstance) {
+        db.prepare(`
+          INSERT INTO schema_instances (id, patient_id, schema_id, project_id, name, instance_type, status)
+          VALUES (?, ?, ?, ?, ?, 'project_crf', 'draft')
+        `).run(instanceId, patientId, project.schema_id, projectId, `${project.schema_id} / ${projectId} / ${patientId}`)
+      }
 
-        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
-        const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
+      for (const scopedField of scopedFields) {
+        const { field, fieldPath, scope } = scopedField
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
