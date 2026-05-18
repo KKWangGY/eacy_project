@@ -160,6 +160,40 @@ function _positionToBbox(position, pageWidth, pageHeight) {
   return [minX, minY, maxX, maxY]
 }
 
+/** 判断坐标数组是否为 OCR /parse 返回的 0~1 归一化坐标。 */
+function _isUnitCoordinateArray(values) {
+  return Array.isArray(values) &&
+    values.length > 0 &&
+    values.every((value) => Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 1)
+}
+
+/** 将 0~1 归一化多边形转换为原图像素坐标，已是像素/千分坐标时保持不变。 */
+function _normalizePolygonToPixels(polygon, pageWidth, pageHeight) {
+  if (!Array.isArray(polygon) || polygon.length < 8) return null
+  const numeric = polygon.map(Number)
+  const hasPageSize = pageWidth > 0 && pageHeight > 0
+  if (hasPageSize && _isUnitCoordinateArray(numeric)) {
+    return numeric.map((value, idx) => value * (idx % 2 === 0 ? pageWidth : pageHeight))
+  }
+  return numeric
+}
+
+/** 将 0~1 归一化 bbox 转为原图像素坐标，避免 page_width/page_height 分母再次缩小。 */
+function _normalizeBboxToPixels(bbox, pageWidth, pageHeight) {
+  if (!Array.isArray(bbox) || bbox.length < 4) return null
+  const numeric = bbox.slice(0, 4).map(Number)
+  const hasPageSize = pageWidth > 0 && pageHeight > 0
+  if (hasPageSize && _isUnitCoordinateArray(numeric)) {
+    return [
+      numeric[0] * pageWidth,
+      numeric[1] * pageHeight,
+      numeric[2] * pageWidth,
+      numeric[3] * pageHeight,
+    ]
+  }
+  return numeric
+}
+
 /** 将 history 接口的 source_location 转为预览组件用的 activeCoordinates（支持单个或多个区块）。
  * 优先使用 content_list 的 position（8 点），无则使用 bbox（4 点）。
  *
@@ -186,7 +220,9 @@ function _sourceLocationToCoordinates(loc) {
       )
     }
     if (!Array.isArray(bbox) || bbox.length < 4) return null
-    const [rawX1, rawY1, rawX2, rawY2] = bbox.map(Number)
+    const normalizedBbox = _normalizeBboxToPixels(bbox, rawPageWidth, rawPageHeight)
+    if (!normalizedBbox) return null
+    const [rawX1, rawY1, rawX2, rawY2] = normalizedBbox
     const x1 = Math.min(rawX1, rawX2)
     const y1 = Math.min(rawY1, rawY2)
     const x2 = Math.max(rawX1, rawX2)
@@ -201,9 +237,7 @@ function _sourceLocationToCoordinates(loc) {
     // 保留 TextIn 8 点 polygon（item.polygon 来自后端 parseSourceLocation 的 position 字段）。
     // 用于精确高亮：拍摄/扫描文档存在轻微倾斜时，多边形比轴对齐 bbox 更贴合实际文字轮廓，
     // 避免在 PDF 上产生"红框跑出文档外"的视觉错位。
-    const polygon = Array.isArray(item.polygon) && item.polygon.length >= 8
-      ? item.polygon.map(Number)
-      : null
+    const polygon = _normalizePolygonToPixels(item.polygon, rawPageWidth, rawPageHeight)
     return {
       x: x1,
       y: y1,

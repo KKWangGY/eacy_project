@@ -21,6 +21,13 @@ if (typeof window !== 'undefined') {
 
 const DEFAULT_BBOX_SCALE = 1000
 
+/** 判断 bbox / polygon 是否为 OCR /parse 返回的 0~1 归一化坐标。 */
+function isUnitCoordinateArray(values) {
+  return Array.isArray(values) &&
+    values.length > 0 &&
+    values.every((value) => Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 1)
+}
+
 export function PdfPageWithHighlight({
   pdfUrl,
   pageNumber = null,
@@ -167,6 +174,14 @@ export function PdfPageWithHighlight({
       const origW = item.page_width
       const origH = item.page_height
       if (origW > 0 && origH > 0) {
+        if (isUnitCoordinateArray([rawX1, rawY1, rawX2, rawY2])) {
+          return {
+            left: x1 * refW,
+            top: y1 * refH,
+            width: w * refW,
+            height: h * refH,
+          }
+        }
         return {
           left: (x1 / origW) * refW,
           top: (y1 / origH) * refH,
@@ -246,6 +261,9 @@ export function PdfPageWithHighlight({
       const origW = item.page_width
       const origH = item.page_height
       if (origW > 0 && origH > 0) {
+        if (isUnitCoordinateArray(raw)) {
+          return pts.map((p) => ({ x: p.x * refW, y: p.y * refH }))
+        }
         return pts.map((p) => ({ x: (p.x / origW) * refW, y: (p.y / origH) * refH }))
       }
       // 自动检测：bbox 明显超 PDF 页 → 推断原图尺寸
