@@ -973,7 +973,8 @@ const ProjectPatientDetail = () => {
       })
 
       if (res.success) {
-        message.success(`保存成功：已更新 ${updates.length} 个字段`)
+        const changedFields = Number(res?.data?.changed_fields ?? updates.length)
+        message.success(`保存成功：已更新 ${changedFields} 个字段`)
         if (typeof refresh === 'function') {
           await refresh()
         }
