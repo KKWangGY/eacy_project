@@ -1100,7 +1100,77 @@ function stripProjectFieldPathIndices(rawPath: string): string {
     .join('/')
 }
 
-function resolveProjectFieldScope(instanceId: string, rawPath: string): {
+/**
+ * 查找或创建可重复 section 实例，用于保存用户新增的项目 CRF 数组行。
+ * @param instanceId schema instance ID。
+ * @param sectionPath section 路径。
+ * @param repeatIndex 重复序号。
+ * @param parentSectionId 父 section ID。
+ * @returns section instance ID；创建失败时返回 null。
+ */
+function ensureProjectSectionInstance(
+  instanceId: string,
+  sectionPath: string,
+  repeatIndex: number,
+  parentSectionId: string | null
+): string | null {
+  const selectSection = db.prepare(`
+    SELECT id FROM section_instances
+    WHERE instance_id = ? AND section_path = ? AND repeat_index = ?
+      AND COALESCE(parent_section_id, '__null__') = COALESCE(?, '__null__')
+    LIMIT 1
+  `)
+  const existing = selectSection.get(instanceId, sectionPath, repeatIndex, parentSectionId) as { id: string } | undefined
+  if (existing?.id) return existing.id
+
+  const id = randomUUID()
+  db.prepare(`
+    INSERT OR IGNORE INTO section_instances
+      (id, instance_id, section_path, parent_section_id, repeat_index, is_repeatable, created_by)
+    VALUES (?, ?, ?, ?, ?, 1, 'user')
+  `).run(id, instanceId, sectionPath, parentSectionId, repeatIndex)
+
+  const created = selectSection.get(instanceId, sectionPath, repeatIndex, parentSectionId) as { id: string } | undefined
+  return created?.id || null
+}
+
+/**
+ * 查找或创建可重复 row 实例，用于保存用户新增的嵌套数组行。
+ * @param instanceId schema instance ID。
+ * @param sectionInstanceId 所属 section instance ID。
+ * @param groupPath row group 路径。
+ * @param repeatIndex 重复序号。
+ * @param parentRowId 父 row ID。
+ * @returns row instance ID；创建失败时返回 null。
+ */
+function ensureProjectRowInstance(
+  instanceId: string,
+  sectionInstanceId: string,
+  groupPath: string,
+  repeatIndex: number,
+  parentRowId: string | null
+): string | null {
+  const selectRow = db.prepare(`
+    SELECT id FROM row_instances
+    WHERE instance_id = ? AND group_path = ? AND repeat_index = ?
+      AND COALESCE(parent_row_id, '__null__') = COALESCE(?, '__null__')
+    LIMIT 1
+  `)
+  const existing = selectRow.get(instanceId, groupPath, repeatIndex, parentRowId) as { id: string } | undefined
+  if (existing?.id) return existing.id
+
+  const id = randomUUID()
+  db.prepare(`
+    INSERT OR IGNORE INTO row_instances
+      (id, instance_id, section_instance_id, group_path, parent_row_id, repeat_index, is_repeatable, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, 1, 'user')
+  `).run(id, instanceId, sectionInstanceId, groupPath, parentRowId, repeatIndex)
+
+  const created = selectRow.get(instanceId, groupPath, repeatIndex, parentRowId) as { id: string } | undefined
+  return created?.id || null
+}
+
+function resolveProjectFieldScope(instanceId: string, rawPath: string, createMissing = false): {
   sectionInstanceId: string | null
   rowInstanceId: string | null
   hasIndices: boolean
@@ -1152,6 +1222,36 @@ function resolveProjectFieldScope(instanceId: string, rawPath: string): {
       sectionInstanceId = section.id
       cumulative.push(segment)
       continue
+    }
+
+    if (createMissing) {
+      if (sectionInstanceId) {
+        const newRowId = ensureProjectRowInstance(
+          instanceId,
+          sectionInstanceId,
+          groupPath,
+          repeatIndex,
+          parentRowId
+        )
+        if (newRowId) {
+          parentRowId = newRowId
+          rowInstanceId = newRowId
+          continue
+        }
+      }
+
+      const newSectionId = ensureProjectSectionInstance(
+        instanceId,
+        sectionPath,
+        repeatIndex,
+        parentSectionId
+      )
+      if (newSectionId) {
+        parentSectionId = newSectionId
+        sectionInstanceId = newSectionId
+        cumulative.push(segment)
+        continue
+      }
     }
 
     return { sectionInstanceId, rowInstanceId, hasIndices: true, resolved: false }
@@ -1679,13 +1779,8 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
         const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
         const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath, true)
-        if (!scope.resolved) {
-          throw Object.assign(
-            new Error(`无法定位可重复表单字段：${requestedFieldPath}`),
-            { statusCode: 400 }
-          )
-        }
+        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
+        if (!scope.resolved) continue
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
@@ -1766,14 +1861,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     })
   } catch (err: any) {
     console.error('[PATCH crf/fields]', err)
-    const statusCode = Number(err?.statusCode || 500)
-    const safeStatusCode = statusCode >= 400 && statusCode < 600 ? statusCode : 500
-    return res.status(safeStatusCode).json({
-      success: false,
-      code: safeStatusCode,
-      message: err?.message || '服务器错误',
-      data: null,
-    })
+    return res.status(500).json({ success: false, code: 500, message: err?.message || '服务器错误', data: null })
   }
 })
 
