@@ -1679,8 +1679,13 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
         const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
         const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
+        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath, true)
+        if (!scope.resolved) {
+          throw Object.assign(
+            new Error(`无法定位可重复表单字段：${requestedFieldPath}`),
+            { statusCode: 400 }
+          )
+        }
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
@@ -1761,7 +1766,14 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     })
   } catch (err: any) {
     console.error('[PATCH crf/fields]', err)
-    return res.status(500).json({ success: false, code: 500, message: err?.message || '服务器错误', data: null })
+    const statusCode = Number(err?.statusCode || 500)
+    const safeStatusCode = statusCode >= 400 && statusCode < 600 ? statusCode : 500
+    return res.status(safeStatusCode).json({
+      success: false,
+      code: safeStatusCode,
+      message: err?.message || '服务器错误',
+      data: null,
+    })
   }
 })
 
