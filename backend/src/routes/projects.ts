@@ -683,6 +683,16 @@ function clearProjectCrfHistoryForPatients(projectId: string, schemaId: string, 
   }
 }
 
+/**
+ * 判断本次项目 CRF 抽取是否应先清空历史。
+ *
+ * 只有明确的全量重抽才允许清空整份 CRF；增量抽取和专项字段组抽取都必须保留
+ * 其它字段的候选、已选值和用户编辑，避免任务提交前造成不可恢复的数据丢失。
+ */
+function shouldClearProjectCrfHistory(mode: string, targetGroups: string[]) {
+  return mode === 'full' && targetGroups.length === 0
+}
+
 function summarizeProjectTask(taskRow: any) {
   if (!taskRow) return null
   const jobIds = normalizeStringList(parseJsonArray(taskRow.job_ids_json))
@@ -1939,7 +1949,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     }
 
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>
-    const mode = String(body.mode || 'incremental').trim() || 'incremental'
+    const mode = String(body.mode || 'incremental').trim().toLowerCase() || 'incremental'
     const targetGroups = normalizeStringList(body.target_groups)
     const { schemaJson, fieldGroups } = getProjectTemplateMeta(proj.schema_id)
     const { targetSections, unresolved } = resolveTargetSections(targetGroups, schemaJson, fieldGroups)
@@ -1980,8 +1990,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
-
     const stmtDocs = db.prepare(`
       SELECT id
       FROM documents
@@ -1994,6 +2002,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     const submittedDocumentIds: string[] = []
     const submittedPatientIds: string[] = []
     const skippedPatients: any[] = []
+    let clearedHistory = { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     for (const patientId of targetPatients) {
       const docRows = stmtDocs.all(patientId) as any[]
@@ -2002,6 +2011,14 @@ async function handleCrfExtraction(req: Request, res: Response) {
       if (docIds.length === 0) {
         skippedPatients.push({ patient_id: patientId, reason: 'no_documents' })
         continue
+      }
+
+      if (shouldClearProjectCrfHistory(mode, targetGroups)) {
+        const patientClearResult = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, [patientId])
+        clearedHistory = {
+          cleared_patient_count: clearedHistory.cleared_patient_count + patientClearResult.cleared_patient_count,
+          cleared_instance_count: clearedHistory.cleared_instance_count + patientClearResult.cleared_instance_count,
+        }
       }
 
       const sectionsToSubmit = targetSections.length > 0 ? targetSections : [null]
