@@ -276,6 +276,8 @@ router.get('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
       SELECT
         fvs.field_path,
         fvs.selected_value_json,
+        fvs.updated_at,
+        fvs.selected_at,
         fvs.section_instance_id,
         fvs.row_instance_id,
         si.section_path,
@@ -327,6 +329,9 @@ router.get('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
         Number(row.section_is_repeatable || 0) === 1
       const hasRepeatableRow = !!row.row_instance_id && typeof row.group_path === 'string' && row.group_path
 
+      let fieldRoot = draftData
+      let fieldPrefixLength = 0
+
       if (hasRepeatableSection) {
         const sectionParts = String(row.section_path).split('/').filter((p: string) => p !== '')
         const sectionParent = ensureObjectPath(draftData, sectionParts.slice(0, -1))
@@ -344,35 +349,39 @@ router.get('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
           sectionArray[sectionIndex] = {}
         }
 
-        const sectionRecord = sectionArray[sectionIndex]
-        const relativeToSection = parts.slice(sectionParts.length)
+        fieldRoot = sectionArray[sectionIndex]
+        fieldPrefixLength = sectionParts.length
+      }
 
-        if (hasRepeatableRow) {
-          const groupParts = String(row.group_path).split('/').filter((p: string) => p !== '')
-          const relativeGroupParts = groupParts.slice(sectionParts.length)
-          const rowContainer = ensureObjectPath(sectionRecord, relativeGroupParts.slice(0, -1))
-          const rowKey = relativeGroupParts[relativeGroupParts.length - 1]
-          if (!Array.isArray(rowContainer[rowKey])) {
-            rowContainer[rowKey] = []
-          }
-
-          const rowArray = rowContainer[rowKey]
-          const rowIndex = Number(row.row_repeat_index || 0)
-          while (rowArray.length <= rowIndex) {
-            rowArray.push({})
-          }
-          if (!rowArray[rowIndex] || typeof rowArray[rowIndex] !== 'object' || Array.isArray(rowArray[rowIndex])) {
-            rowArray[rowIndex] = {}
-          }
-
-          const relativeToRow = parts.slice(groupParts.length)
-          if (relativeToRow.length === 0) continue
-          setObjectValue(rowArray[rowIndex], relativeToRow, value)
-          continue
+      if (hasRepeatableRow) {
+        const groupParts = String(row.group_path).split('/').filter((p: string) => p !== '')
+        const relativeGroupParts = groupParts.slice(fieldPrefixLength)
+        const rowKey = relativeGroupParts[relativeGroupParts.length - 1]
+        if (!rowKey) continue
+        const rowContainer = ensureObjectPath(fieldRoot, relativeGroupParts.slice(0, -1))
+        if (!Array.isArray(rowContainer[rowKey])) {
+          rowContainer[rowKey] = []
         }
 
+        const rowArray = rowContainer[rowKey]
+        const rowIndex = Number(row.row_repeat_index || 0)
+        while (rowArray.length <= rowIndex) {
+          rowArray.push({})
+        }
+        if (!rowArray[rowIndex] || typeof rowArray[rowIndex] !== 'object' || Array.isArray(rowArray[rowIndex])) {
+          rowArray[rowIndex] = {}
+        }
+
+        const relativeToRow = parts.slice(groupParts.length)
+        if (relativeToRow.length === 0) continue
+        setObjectValue(rowArray[rowIndex], relativeToRow, value)
+        continue
+      }
+
+      if (hasRepeatableSection) {
+        const relativeToSection = parts.slice(fieldPrefixLength)
         if (relativeToSection.length === 0) continue
-        setObjectValue(sectionRecord, relativeToSection, value)
+        setObjectValue(fieldRoot, relativeToSection, value)
         continue
       }
 
