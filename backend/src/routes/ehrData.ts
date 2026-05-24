@@ -178,6 +178,91 @@ function resolveScopeFromPath(instanceId: string, rawPath: string): ResolvedScop
 }
 
 /**
+ * 确保手动保存新增 repeatable 行时，对应的 section/row scope 已存在。
+ *
+ * 前端新增记录会先提交如 `/诊断记录/1/主要诊断` 的索引路径；如果该索引
+ * 尚未被 AI 物化，单纯解析会失败并导致保存被跳过。这里按物化器约定补建
+ * 缺失实例，保证用户新增字段可以落库。
+ */
+function ensureScopeFromPath(instanceId: string, rawPath: string): ResolvedScope {
+  const normalizedPath = normalizeScopePath(rawPath)
+  const segments = normalizedPath.split('/').filter(Boolean)
+  const hasIndices = segments.some((s) => /^\d+$/.test(s))
+  if (!hasIndices) {
+    return { sectionInstanceId: null, rowInstanceId: null, hasIndices: false, resolved: true }
+  }
+
+  let sectionInstanceId: string | null = null
+  let rowInstanceId: string | null = null
+  let parentSectionId: string | null = null
+  let parentRowId: string | null = null
+  const cumulative: string[] = []
+
+  for (const seg of segments) {
+    if (!/^\d+$/.test(seg)) {
+      cumulative.push(seg)
+      continue
+    }
+
+    const idx = Number(seg)
+    const groupPath = '/' + cumulative.join('/')
+
+    const row = db.prepare(`
+      SELECT id, section_instance_id FROM row_instances
+      WHERE instance_id = ? AND group_path = ? AND repeat_index = ?
+        AND COALESCE(parent_row_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, groupPath, idx, parentRowId) as { id: string; section_instance_id: string } | undefined
+
+    if (row) {
+      parentRowId = row.id
+      rowInstanceId = row.id
+      sectionInstanceId = row.section_instance_id || sectionInstanceId
+      continue
+    }
+
+    const sectionPath = '/' + cumulative.filter((s) => !/^\d+$/.test(s)).join('/')
+    const section = db.prepare(`
+      SELECT id FROM section_instances
+      WHERE instance_id = ? AND section_path = ? AND repeat_index = ?
+        AND COALESCE(parent_section_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, sectionPath, idx, parentSectionId) as { id: string } | undefined
+
+    if (section) {
+      parentSectionId = section.id
+      sectionInstanceId = section.id
+      cumulative.push(seg)
+      continue
+    }
+
+    if (sectionInstanceId) {
+      const newRowId = randomUUID()
+      db.prepare(`
+        INSERT INTO row_instances
+          (id, instance_id, section_instance_id, group_path, parent_row_id, repeat_index, is_repeatable, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, 1, 'user')
+      `).run(newRowId, instanceId, sectionInstanceId, groupPath, parentRowId, idx)
+      parentRowId = newRowId
+      rowInstanceId = newRowId
+      continue
+    }
+
+    const newSectionId = randomUUID()
+    db.prepare(`
+      INSERT INTO section_instances
+        (id, instance_id, section_path, parent_section_id, repeat_index, is_repeatable, created_by)
+      VALUES (?, ?, ?, ?, ?, 1, 'user')
+    `).run(newSectionId, instanceId, sectionPath, parentSectionId, idx)
+    parentSectionId = newSectionId
+    sectionInstanceId = newSectionId
+    cumulative.push(seg)
+  }
+
+  return { sectionInstanceId, rowInstanceId, hasIndices: true, resolved: true }
+}
+
+/**
  * 将 ResolvedScope 转换为 SQL WHERE 片段 + 参数列表，供 field_value_candidates /
  * field_value_selected 查询附加使用。
  *   - 无索引路径：不加过滤（向后兼容 "查所有行" 的语义）
@@ -531,8 +616,10 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     const saveAll = db.transaction(() => {
       for (const field of flatFields) {
         totalCount++
-        const scope = resolveScopeFromPath(instance.id, field.requestedPath)
-        if (!scope.resolved) continue
+        const scope = ensureScopeFromPath(instance.id, field.requestedPath)
+        if (!scope.resolved) {
+          throw new Error(`无法解析字段作用域: ${field.requestedPath}`)
+        }
 
         const oldRow = db.prepare(`
           SELECT selected_value_json FROM field_value_selected

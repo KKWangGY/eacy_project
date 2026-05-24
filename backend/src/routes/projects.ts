@@ -1161,6 +1161,93 @@ function resolveProjectFieldScope(instanceId: string, rawPath: string): {
 }
 
 /**
+ * 为项目 CRF 手动保存补建缺失的 repeatable section/row scope。
+ *
+ * 新增记录在第一次保存前不会有物化器创建的实例行；若继续静默跳过会造成
+ * “保存成功但刷新丢失”。该函数按现有物化路径规则补齐 scope 后再写字段值。
+ */
+function ensureProjectFieldScope(instanceId: string, rawPath: string): {
+  sectionInstanceId: string | null
+  rowInstanceId: string | null
+  hasIndices: boolean
+  resolved: boolean
+} {
+  const segments = normalizeProjectFieldPath(rawPath).split('/').filter(Boolean)
+  const hasIndices = segments.some((segment) => /^\d+$/.test(segment))
+  if (!hasIndices) {
+    return { sectionInstanceId: null, rowInstanceId: null, hasIndices: false, resolved: true }
+  }
+
+  let sectionInstanceId: string | null = null
+  let rowInstanceId: string | null = null
+  let parentSectionId: string | null = null
+  let parentRowId: string | null = null
+  const cumulative: string[] = []
+
+  for (const segment of segments) {
+    if (!/^\d+$/.test(segment)) {
+      cumulative.push(segment)
+      continue
+    }
+
+    const repeatIndex = Number(segment)
+    const groupPath = '/' + cumulative.join('/')
+    const row = db.prepare(`
+      SELECT id, section_instance_id FROM row_instances
+      WHERE instance_id = ? AND group_path = ? AND repeat_index = ?
+        AND COALESCE(parent_row_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, groupPath, repeatIndex, parentRowId) as { id: string; section_instance_id: string } | undefined
+
+    if (row) {
+      parentRowId = row.id
+      rowInstanceId = row.id
+      sectionInstanceId = row.section_instance_id || sectionInstanceId
+      continue
+    }
+
+    const sectionPath = '/' + cumulative.filter((part) => !/^\d+$/.test(part)).join('/')
+    const section = db.prepare(`
+      SELECT id FROM section_instances
+      WHERE instance_id = ? AND section_path = ? AND repeat_index = ?
+        AND COALESCE(parent_section_id, '__null__') = COALESCE(?, '__null__')
+      LIMIT 1
+    `).get(instanceId, sectionPath, repeatIndex, parentSectionId) as { id: string } | undefined
+
+    if (section) {
+      parentSectionId = section.id
+      sectionInstanceId = section.id
+      cumulative.push(segment)
+      continue
+    }
+
+    if (sectionInstanceId) {
+      const rowId = randomUUID()
+      db.prepare(`
+        INSERT INTO row_instances
+          (id, instance_id, section_instance_id, group_path, parent_row_id, repeat_index, is_repeatable, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, 1, 'user')
+      `).run(rowId, instanceId, sectionInstanceId, groupPath, parentRowId, repeatIndex)
+      parentRowId = rowId
+      rowInstanceId = rowId
+      continue
+    }
+
+    const sectionId = randomUUID()
+    db.prepare(`
+      INSERT INTO section_instances
+        (id, instance_id, section_path, parent_section_id, repeat_index, is_repeatable, created_by)
+      VALUES (?, ?, ?, ?, ?, 1, 'user')
+    `).run(sectionId, instanceId, sectionPath, parentSectionId, repeatIndex)
+    parentSectionId = sectionId
+    sectionInstanceId = sectionId
+    cumulative.push(segment)
+  }
+
+  return { sectionInstanceId, rowInstanceId, hasIndices: true, resolved: true }
+}
+
+/**
  * PATCH /api/v1/projects/:projectId
  * 更新科研项目基础信息。
  */
@@ -1679,8 +1766,10 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
         const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
         const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
+        const scope = ensureProjectFieldScope(instanceId, requestedFieldPath)
+        if (!scope.resolved) {
+          throw new Error(`无法解析字段作用域: ${requestedFieldPath}`)
+        }
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
