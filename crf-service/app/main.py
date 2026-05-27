@@ -330,6 +330,52 @@ class BatchExtractRequest(BaseModel):
         default=None,
         description="可选：多个靶向 section 名。用于科研专项抽取一次提交多个字段组",
     )
+    reset_project_crf_history: bool = Field(
+        default=False,
+        description="创建新项目 CRF job 后、派发前清空该患者在本项目模板下的旧物化结果",
+    )
+
+
+def _clear_project_crf_history(
+    conn: Any,
+    *,
+    project_id: Optional[str],
+    schema_id: str,
+    patient_id: str,
+) -> Dict[str, int]:
+    """
+    清空单个患者在项目 CRF 下的旧物化结果。
+
+    该操作只在 `/api/extract/batch` 已经成功创建新 job、且 Celery 尚未派发时执行，
+    避免调用方在 CRF 服务不可用或无新 job 时先删除用户已有数据。
+    """
+    if not project_id or not schema_id or not patient_id:
+        return {"cleared_patient_count": 0, "cleared_instance_count": 0}
+
+    instances = conn.execute(
+        """
+        SELECT id
+        FROM schema_instances
+        WHERE project_id = ?
+          AND schema_id = ?
+          AND patient_id = ?
+          AND instance_type = 'project_crf'
+        """,
+        (project_id, schema_id, patient_id),
+    ).fetchall()
+    instance_ids = [row["id"] for row in instances if row["id"]]
+    if not instance_ids:
+        return {"cleared_patient_count": 0, "cleared_instance_count": 0}
+
+    placeholders = ",".join("?" for _ in instance_ids)
+    conn.execute(f"DELETE FROM field_value_selected WHERE instance_id IN ({placeholders})", instance_ids)
+    conn.execute(f"DELETE FROM field_value_candidates WHERE instance_id IN ({placeholders})", instance_ids)
+    conn.execute(f"DELETE FROM extraction_runs WHERE instance_id IN ({placeholders})", instance_ids)
+    conn.execute(f"DELETE FROM instance_documents WHERE instance_id IN ({placeholders})", instance_ids)
+    conn.execute(f"DELETE FROM row_instances WHERE instance_id IN ({placeholders})", instance_ids)
+    conn.execute(f"DELETE FROM section_instances WHERE instance_id IN ({placeholders})", instance_ids)
+    conn.execute(f"DELETE FROM schema_instances WHERE id IN ({placeholders})", instance_ids)
+    return {"cleared_patient_count": 1, "cleared_instance_count": len(instance_ids)}
 
 
 @app.post("/api/extract/batch")
@@ -341,6 +387,7 @@ async def submit_batch_extraction(req: BatchExtractRequest):
     """
     repo = CRFRepo()
     jobs = []
+    reset_history = {"cleared_patient_count": 0, "cleared_instance_count": 0}
 
     with repo.connect() as conn:
         schema_rec = repo.get_schema(conn, req.schema_id)
@@ -359,6 +406,13 @@ async def submit_batch_extraction(req: BatchExtractRequest):
             )
             if job_id:
                 jobs.append({"document_id": doc_id, "job_id": job_id})
+        if jobs and req.reset_project_crf_history and req.instance_type == "project_crf":
+            reset_history = _clear_project_crf_history(
+                conn,
+                project_id=req.project_id,
+                schema_id=actual_schema_id,
+                patient_id=req.patient_id,
+            )
         conn.commit()
 
     if not jobs:
@@ -366,6 +420,7 @@ async def submit_batch_extraction(req: BatchExtractRequest):
             "success": True,
             "message": "所有文档已有活跃任务，无需重复提交",
             "jobs": [],
+            "reset_history": reset_history,
         }
 
     # 派发一个合并的 Celery task，包含所有文档 ID
@@ -388,6 +443,7 @@ async def submit_batch_extraction(req: BatchExtractRequest):
         "success": True,
         "message": f"已提交合并抽取任务，共 {len(all_doc_ids)} 个文档",
         "jobs": jobs,
+        "reset_history": reset_history,
     }
 
 
