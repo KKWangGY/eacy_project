@@ -644,45 +644,6 @@ function getProjectCrfHistoryStats(patientId: string, schemaId: string | null | 
   }
 }
 
-function clearProjectCrfHistoryForPatients(projectId: string, schemaId: string, patientIds: string[]) {
-  const normalizedPatientIds = normalizeStringList(patientIds)
-  if (!projectId || !schemaId || normalizedPatientIds.length === 0) {
-    return { cleared_patient_count: 0, cleared_instance_count: 0 }
-  }
-
-  const placeholders = normalizedPatientIds.map(() => '?').join(',')
-  const instances = db.prepare(`
-    SELECT id, patient_id
-    FROM schema_instances
-    WHERE project_id = ?
-      AND schema_id = ?
-      AND instance_type = 'project_crf'
-      AND patient_id IN (${placeholders})
-  `).all(projectId, schemaId, ...normalizedPatientIds) as Array<{ id: string; patient_id: string }>
-
-  const instanceIds = normalizeStringList(instances.map((item) => item.id))
-  if (instanceIds.length === 0) {
-    return { cleared_patient_count: 0, cleared_instance_count: 0 }
-  }
-
-  const instancePlaceholders = instanceIds.map(() => '?').join(',')
-  const tx = db.transaction(() => {
-    db.prepare(`DELETE FROM field_value_selected WHERE instance_id IN (${instancePlaceholders})`).run(...instanceIds)
-    db.prepare(`DELETE FROM field_value_candidates WHERE instance_id IN (${instancePlaceholders})`).run(...instanceIds)
-    db.prepare(`DELETE FROM extraction_runs WHERE instance_id IN (${instancePlaceholders})`).run(...instanceIds)
-    db.prepare(`DELETE FROM instance_documents WHERE instance_id IN (${instancePlaceholders})`).run(...instanceIds)
-    db.prepare(`DELETE FROM row_instances WHERE instance_id IN (${instancePlaceholders})`).run(...instanceIds)
-    db.prepare(`DELETE FROM section_instances WHERE instance_id IN (${instancePlaceholders})`).run(...instanceIds)
-    db.prepare(`DELETE FROM schema_instances WHERE id IN (${instancePlaceholders})`).run(...instanceIds)
-  })
-  tx()
-
-  return {
-    cleared_patient_count: new Set(instances.map((item) => item.patient_id)).size,
-    cleared_instance_count: instanceIds.length,
-  }
-}
-
 function summarizeProjectTask(taskRow: any) {
   if (!taskRow) return null
   const jobIds = normalizeStringList(parseJsonArray(taskRow.job_ids_json))
@@ -1980,8 +1941,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
-
     const stmtDocs = db.prepare(`
       SELECT id
       FROM documents
@@ -1994,6 +1953,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     const submittedDocumentIds: string[] = []
     const submittedPatientIds: string[] = []
     const skippedPatients: any[] = []
+    const clearedHistory = { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     for (const patientId of targetPatients) {
       const docRows = stmtDocs.all(patientId) as any[]
@@ -2006,6 +1966,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
 
       const sectionsToSubmit = targetSections.length > 0 ? targetSections : [null]
       const jobIds: string[] = []
+      let shouldResetHistory = true
 
       for (const targetSection of sectionsToSubmit) {
         const payload: Record<string, any> = {
@@ -2014,6 +1975,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
           project_id: projectId,
           document_ids: docIds,
           instance_type: 'project_crf',
+          reset_project_crf_history: shouldResetHistory,
         }
         if (targetSection) payload.target_section = targetSection
 
@@ -2041,7 +2003,14 @@ async function handleCrfExtraction(req: Request, res: Response) {
 
         const result = await response.json()
         const jobs = Array.isArray(result?.jobs) ? result.jobs : []
-        jobIds.push(...normalizeStringList(jobs.map((job: any) => job?.job_id)))
+        const newJobIds = normalizeStringList(jobs.map((job: any) => job?.job_id))
+        jobIds.push(...newJobIds)
+        if (newJobIds.length > 0) {
+          const resetHistory = result?.reset_history || {}
+          clearedHistory.cleared_patient_count += Number(resetHistory.cleared_patient_count || 0)
+          clearedHistory.cleared_instance_count += Number(resetHistory.cleared_instance_count || 0)
+          shouldResetHistory = false
+        }
       }
 
       if (jobIds.length === 0) {
