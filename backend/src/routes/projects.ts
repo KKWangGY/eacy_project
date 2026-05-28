@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express'
 import { randomUUID } from 'crypto'
 import db from '../db.js'
-import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
+import { crfServiceFetch, crfServiceSubmitBatch } from '../services/crfServiceClient.js'
 
 const router = Router()
 
@@ -69,6 +69,42 @@ function parseJsonArray(raw: unknown): any[] {
 function normalizeStringList(values: unknown): string[] {
   if (!Array.isArray(values)) return []
   return [...new Set(values.map((item) => String(item ?? '').trim()).filter(Boolean))]
+}
+
+/**
+ * 判断项目 CRF 抽取是否需要先清理旧结果。
+ * 仅 full 模式表达"覆盖历史数据"；默认 incremental 应保留既有候选值与人工编辑。
+ */
+function shouldClearProjectCrfHistory(mode: string): boolean {
+  return String(mode || '').trim().toLowerCase() === 'full'
+}
+
+/**
+ * 在执行 full 模式的破坏性清理前确认 CRF 服务与依赖可用。
+ * 避免服务宕机时先删历史数据、随后提交任务失败。
+ */
+async function getCrfReadinessError(): Promise<string | null> {
+  let response: globalThis.Response
+  try {
+    response = await crfServiceFetch('/health', { method: 'GET', skipJsonHeader: true })
+  } catch (error: any) {
+    return error?.message || '连接失败'
+  }
+
+  if (!response.ok) {
+    return `健康检查返回 ${response.status}`
+  }
+
+  try {
+    const health = await response.json()
+    if (health?.status && health.status !== 'healthy') {
+      return `健康状态为 ${health.status}`
+    }
+  } catch {
+    return '健康检查响应无法解析'
+  }
+
+  return null
 }
 
 function normalizeSourceList(value: unknown): string[] {
@@ -1980,8 +2016,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
-
     const stmtDocs = db.prepare(`
       SELECT id
       FROM documents
@@ -1994,6 +2028,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     const submittedDocumentIds: string[] = []
     const submittedPatientIds: string[] = []
     const skippedPatients: any[] = []
+    const submissions: Array<{ patientId: string; docIds: string[]; targetSection: string | null }> = []
 
     for (const patientId of targetPatients) {
       const docRows = stmtDocs.all(patientId) as any[]
@@ -2005,45 +2040,74 @@ async function handleCrfExtraction(req: Request, res: Response) {
       }
 
       const sectionsToSubmit = targetSections.length > 0 ? targetSections : [null]
-      const jobIds: string[] = []
-
       for (const targetSection of sectionsToSubmit) {
-        const payload: Record<string, any> = {
-          patient_id: patientId,
-          schema_id: proj.schema_id,
-          project_id: projectId,
-          document_ids: docIds,
-          instance_type: 'project_crf',
-        }
-        if (targetSection) payload.target_section = targetSection
+        submissions.push({ patientId, docIds, targetSection })
+      }
+    }
 
-        let response: Awaited<ReturnType<typeof crfServiceSubmitBatch>>
-        try {
-          response = await crfServiceSubmitBatch(payload)
-        } catch (error: any) {
-          return res.status(502).json({
-            success: false,
-            code: 502,
-            message: `CRF 服务不可用：${error?.message || '提交失败'}`,
-            data: { target_section: targetSection, project_id: projectId, patient_id: patientId },
-          })
-        }
+    const patientsToSubmit = normalizeStringList(submissions.map((item) => item.patientId))
+    const clearHistory = shouldClearProjectCrfHistory(mode) && patientsToSubmit.length > 0
+    if (clearHistory) {
+      const readinessError = await getCrfReadinessError()
+      if (readinessError) {
+        return res.status(502).json({
+          success: false,
+          code: 502,
+          message: `CRF 服务不可用，已保留历史数据：${readinessError}`,
+          data: { project_id: projectId, submitted_patient_count: 0 },
+        })
+      }
+    }
+    const clearedHistory = clearHistory
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, patientsToSubmit)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
+    const jobIdsByPatient = new Map<string, string[]>()
 
-        if (!response.ok) {
-          const errorText = await response.text()
-          return res.status(response.status).json({
-            success: false,
-            code: response.status,
-            message: errorText || '提交科研抽取任务失败',
-            data: { target_section: targetSection, project_id: projectId, patient_id: patientId },
-          })
-        }
+    for (const submission of submissions) {
+      const { patientId, docIds, targetSection } = submission
+      const payload: Record<string, any> = {
+        patient_id: patientId,
+        schema_id: proj.schema_id,
+        project_id: projectId,
+        document_ids: docIds,
+        instance_type: 'project_crf',
+      }
+      if (targetSection) payload.target_section = targetSection
 
-        const result = await response.json()
-        const jobs = Array.isArray(result?.jobs) ? result.jobs : []
-        jobIds.push(...normalizeStringList(jobs.map((job: any) => job?.job_id)))
+      let response: Awaited<ReturnType<typeof crfServiceSubmitBatch>>
+      try {
+        response = await crfServiceSubmitBatch(payload)
+      } catch (error: any) {
+        return res.status(502).json({
+          success: false,
+          code: 502,
+          message: `CRF 服务不可用：${error?.message || '提交失败'}`,
+          data: { target_section: targetSection, project_id: projectId, patient_id: patientId },
+        })
       }
 
+      if (!response.ok) {
+        const errorText = await response.text()
+        return res.status(response.status).json({
+          success: false,
+          code: response.status,
+          message: errorText || '提交科研抽取任务失败',
+          data: { target_section: targetSection, project_id: projectId, patient_id: patientId },
+        })
+      }
+
+      const result = await response.json()
+      const jobs = Array.isArray(result?.jobs) ? result.jobs : []
+      const jobIds = normalizeStringList(jobs.map((job: any) => job?.job_id))
+      if (jobIds.length > 0) {
+        const existing = jobIdsByPatient.get(patientId) || []
+        existing.push(...jobIds)
+        jobIdsByPatient.set(patientId, existing)
+      }
+    }
+
+    for (const patientId of patientsToSubmit) {
+      const jobIds = normalizeStringList(jobIdsByPatient.get(patientId) || [])
       if (jobIds.length === 0) {
         skippedPatients.push({ patient_id: patientId, reason: 'no_new_jobs' })
         continue
@@ -2051,6 +2115,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
 
       submittedPatientIds.push(patientId)
       submittedJobIds.push(...jobIds)
+      const docIds = normalizeStringList(submissions.find((item) => item.patientId === patientId)?.docIds || [])
       submittedDocumentIds.push(...docIds)
     }
 
