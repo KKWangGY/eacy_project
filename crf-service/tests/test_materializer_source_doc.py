@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.core.materializer import Materializer
 
 
@@ -82,6 +84,34 @@ def test_per_doc_payload_does_not_cross_contaminate(repo, seed_basic):
     assert json.loads(by_doc["doc_a"]["value_json"]) == "张三"
     assert by_doc["doc_b"]["field_path"] == "/出院信息/出院诊断"
     assert json.loads(by_doc["doc_b"]["value_json"]) == "高血压"
+
+
+def test_project_crf_requires_project_id(repo, seed_basic):
+    """
+    场景：科研 CRF 抽取没有传 project_id。
+    预期：物化层拒绝创建空 project_id 的 project_crf 实例，避免跨项目混写。
+    """
+    materializer = Materializer(repo)
+    payload = {
+        "task_results": [
+            {
+                "path": ["基本信息"],
+                "extracted": {"姓名": "张三"},
+                "audit": {"fields": {}},
+            }
+        ]
+    }
+
+    with repo.connect() as conn:
+        with pytest.raises(ValueError, match="project_id"):
+            materializer.materialize(
+                conn=conn,
+                patient_id=seed_basic["patient_id"],
+                document_id="doc_a",
+                schema_id=seed_basic["schema_id"],
+                extract_payload=payload,
+                instance_type="project_crf",
+            )
 
 
 def test_ai_overwrites_previous_ai_but_keeps_user_edits(repo, seed_basic):
@@ -237,6 +267,7 @@ def test_schema_instance_name_defaults_by_instance_type(repo, seed_basic):
                 "path": ["x"], "extracted": {"y": 1}, "audit": {"fields": {}},
             }]},
             instance_type="project_crf",
+            project_id="project_for_pat2",
         )
         conn.commit()
 

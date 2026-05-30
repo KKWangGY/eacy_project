@@ -34,6 +34,7 @@ const ActionTypes = {
   SET_PATIENT_DATA: 'SET_PATIENT_DATA',
   SET_DRAFT_DATA: 'SET_DRAFT_DATA',
   UPDATE_FIELD_VALUE: 'UPDATE_FIELD_VALUE',
+  APPLY_PERSISTED_FIELD_VALUE: 'APPLY_PERSISTED_FIELD_VALUE',
   SET_SELECTED_PATH: 'SET_SELECTED_PATH',
   SET_EXPANDED_KEYS: 'SET_EXPANDED_KEYS',
   SET_EDITING_FIELD: 'SET_EDITING_FIELD',
@@ -77,6 +78,22 @@ function schemaFormReducer(state, action) {
         ...state,
         draftData: newDraftData,
         isDirty: true
+      }
+    }
+
+    case ActionTypes.APPLY_PERSISTED_FIELD_VALUE: {
+      const { path, value, rowUid } = action.payload
+      const newDraftData = JSON.parse(JSON.stringify(state.draftData || {}))
+      const newPatientData = JSON.parse(JSON.stringify(state.patientData || {}))
+      setNestedValue(newDraftData, path, value)
+      setNestedValue(newPatientData, path, value)
+      applyRowUidForPath(newDraftData, path, rowUid)
+      applyRowUidForPath(newPatientData, path, rowUid)
+      return {
+        ...state,
+        patientData: newPatientData,
+        draftData: newDraftData,
+        isDirty: JSON.stringify(newDraftData) !== JSON.stringify(newPatientData)
       }
     }
     
@@ -200,6 +217,32 @@ function setNestedValue(obj, path, value) {
   }
 }
 
+/**
+ * 为候选值所在的可重复行补齐稳定 row uid。
+ *
+ * @param {Record<string, any>} obj 表单数据。
+ * @param {string} path 字段路径。
+ * @param {string | null | undefined} rowUid 可重复行 uid。
+ * @returns {void}
+ */
+function applyRowUidForPath(obj, path, rowUid) {
+  const normalizedRowUid = String(rowUid || '').trim()
+  if (!obj || !path || !normalizedRowUid) return
+  const keys = String(path).split('.').filter(Boolean)
+  let current = obj
+  for (const key of keys) {
+    if (/^\d+$/.test(key)) {
+      const index = parseInt(key, 10)
+      if (!Array.isArray(current) || !current[index] || typeof current[index] !== 'object') return
+      current[index]._row_uid = current[index]._row_uid || normalizedRowUid
+      current = current[index]
+      continue
+    }
+    if (!current || typeof current !== 'object') return
+    current = current[key]
+  }
+}
+
 // 创建Context
 const SchemaFormContext = createContext(null)
 
@@ -253,6 +296,11 @@ export function SchemaFormProvider({ children, schema, patientData, enums }) {
     updateFieldValue: (path, value) => dispatch({
       type: ActionTypes.UPDATE_FIELD_VALUE,
       payload: { path, value }
+    }),
+
+    applyPersistedFieldValue: (path, value, rowUid = null) => dispatch({
+      type: ActionTypes.APPLY_PERSISTED_FIELD_VALUE,
+      payload: { path, value, rowUid }
     }),
     
     setSelectedPath: (path) => dispatch({

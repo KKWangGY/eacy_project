@@ -142,6 +142,29 @@ class JobStatusResponse(BaseModel):
     result: Optional[Dict[str, Any]] = None
 
 
+def _validate_project_crf_request(conn, *, patient_id: str, schema_id: str, project_id: Optional[str]) -> None:
+    """校验科研 CRF 抽取必须绑定到明确且已入组的项目。"""
+    clean_project_id = (project_id or "").strip()
+    if not clean_project_id:
+        raise HTTPException(status_code=400, detail="project_crf 抽取必须指定 project_id")
+
+    project = conn.execute(
+        "SELECT id, schema_id FROM projects WHERE id = ? LIMIT 1",
+        (clean_project_id,),
+    ).fetchone()
+    if not project:
+        raise HTTPException(status_code=400, detail=f"项目不存在: {clean_project_id}")
+    if project["schema_id"] != schema_id:
+        raise HTTPException(status_code=400, detail="project_id 与 schema_id 不匹配")
+
+    enrollment = conn.execute(
+        "SELECT 1 FROM project_patients WHERE project_id = ? AND patient_id = ? LIMIT 1",
+        (clean_project_id, patient_id),
+    ).fetchone()
+    if not enrollment:
+        raise HTTPException(status_code=403, detail="患者未入组该项目，无法写入科研 CRF")
+
+
 # ── 健康检查 ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -187,6 +210,13 @@ async def submit_extraction(req: ExtractRequest):
         if not schema_rec:
             raise HTTPException(status_code=400, detail=f"Schema 不存在: {req.schema_id}")
         actual_schema_id = schema_rec["id"]
+        if req.instance_type == "project_crf":
+            _validate_project_crf_request(
+                conn,
+                patient_id=req.patient_id,
+                schema_id=actual_schema_id,
+                project_id=req.project_id,
+            )
 
         # 创建 job
         job_id = repo.create_job(
@@ -347,6 +377,13 @@ async def submit_batch_extraction(req: BatchExtractRequest):
         if not schema_rec:
             raise HTTPException(status_code=400, detail=f"Schema 不存在: {req.schema_id}")
         actual_schema_id = schema_rec["id"]
+        if req.instance_type == "project_crf":
+            _validate_project_crf_request(
+                conn,
+                patient_id=req.patient_id,
+                schema_id=actual_schema_id,
+                project_id=req.project_id,
+            )
 
         for doc_id in req.document_ids:
             job_type = f"extract:target:{req.target_section}" if req.target_section else "extract"

@@ -1722,6 +1722,15 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
   let schemaId = req.body.schema_id || null
   let instanceType = req.body.instance_type || null
 
+  if (!requestedProjectId && instanceType === 'project_crf') {
+    return res.status(400).json({
+      success: false,
+      code: 400,
+      message: '科研 CRF 抽取必须指定 project_id',
+      data: null,
+    })
+  }
+
   if (requestedProjectId) {
     const proj = db.prepare(`SELECT schema_id FROM projects WHERE id = ?`).get(requestedProjectId) as { schema_id?: string } | undefined
     if (!proj?.schema_id) {
@@ -1730,6 +1739,17 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
         code: 400,
         message: '项目未绑定 CRF 模板/schema，无法进行科研靶向抽取',
         data: { project_id: requestedProjectId },
+      })
+    }
+    const enrollment = db.prepare(`
+      SELECT 1 FROM project_patients WHERE project_id = ? AND patient_id = ?
+    `).get(requestedProjectId, patientId) as { [key: string]: unknown } | undefined
+    if (!enrollment) {
+      return res.status(403).json({
+        success: false,
+        code: 403,
+        message: '患者未入组该项目，无法写入科研 CRF 抽取结果',
+        data: { project_id: requestedProjectId, patient_id: patientId },
       })
     }
     schemaId = schemaId || proj.schema_id
