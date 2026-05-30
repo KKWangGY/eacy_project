@@ -491,6 +491,8 @@ class CRFRepo:
         """
         project_id = (project_id or "").strip() or None
         if instance_type == "project_crf":
+            if not project_id:
+                raise ValueError("project_crf schema instance requires project_id")
             row = conn.execute(
                 """
                 SELECT id FROM schema_instances

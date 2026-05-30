@@ -16,6 +16,7 @@ test('SchemaForm 应暴露科研候选固化回调入口', () => {
   assert.match(content, /onFieldCandidateSolidified/)
   assert.match(
     content,
-    /if \(projectMode && typeof onFieldCandidateSolidified === 'function'\)/,
+    /if \(!isDirty && projectMode && typeof onFieldCandidateSolidified === 'function'\)/,
   )
+  assert.match(content, /actions\.applyPersistedFieldValue\(fieldPath, value, rowUid\)/)
 })
