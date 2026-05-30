@@ -267,6 +267,7 @@ def test_schema_instance_name_defaults_by_instance_type(repo, seed_basic):
                 "path": ["x"], "extracted": {"y": 1}, "audit": {"fields": {}},
             }]},
             instance_type="project_crf",
+            project_id="project_for_pat2",
         )
         conn.commit()
 
