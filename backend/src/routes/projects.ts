@@ -1669,18 +1669,41 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
     const updatedAt = new Date().toISOString()
     let changedCount = 0
+    const scopedFields: Array<{
+      field: any
+      requestedFieldPath: string
+      fieldPath: string
+      scope: ReturnType<typeof resolveProjectFieldScope>
+    }> = []
+    const unresolvedFieldPaths: string[] = []
+
+    for (const field of fields) {
+      const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+      const groupId = String(field?.group_id || '').trim()
+      const fieldKey = String(field?.field_key || '').trim()
+      if (!explicitFieldPath && (!groupId || !fieldKey)) continue
+
+      const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+      const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
+      const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
+      if (!scope.resolved) {
+        unresolvedFieldPaths.push(requestedFieldPath)
+        continue
+      }
+      scopedFields.push({ field, requestedFieldPath, fieldPath, scope })
+    }
+
+    if (unresolvedFieldPaths.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '字段路径中的重复项索引无法定位，请刷新项目 CRF 后重试',
+        data: { unresolved_field_paths: unresolvedFieldPaths },
+      })
+    }
 
     const saveAll = db.transaction(() => {
-      for (const field of fields) {
-        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
-        const groupId = String(field?.group_id || '').trim()
-        const fieldKey = String(field?.field_key || '').trim()
-        if (!explicitFieldPath && (!groupId || !fieldKey)) continue
-
-        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
-        const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
+      for (const { field, fieldPath, scope } of scopedFields) {
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
