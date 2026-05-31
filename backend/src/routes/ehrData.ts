@@ -525,15 +525,27 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     `)
 
+    const scopedFields = flatFields.map((field) => ({
+      field,
+      scope: resolveScopeFromPath(instance.id, field.requestedPath),
+    }))
+    const unresolvedFields = scopedFields.filter(({ scope }) => !scope.resolved)
+    if (unresolvedFields.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '字段路径中的重复项索引无法定位，请刷新病历夹后重试',
+        data: {
+          unresolved_field_paths: unresolvedFields.map(({ field }) => field.requestedPath),
+        },
+      })
+    }
+
     let changedCount = 0
-    let totalCount = 0
+    const totalCount = flatFields.length
 
     const saveAll = db.transaction(() => {
-      for (const field of flatFields) {
-        totalCount++
-        const scope = resolveScopeFromPath(instance.id, field.requestedPath)
-        if (!scope.resolved) continue
-
+      for (const { field, scope } of scopedFields) {
         const oldRow = db.prepare(`
           SELECT selected_value_json FROM field_value_selected
           WHERE instance_id = ?
