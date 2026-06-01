@@ -528,6 +528,19 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     let changedCount = 0
     let totalCount = 0
 
+    const unresolvedFields = flatFields
+      .filter((field) => !resolveScopeFromPath(instance.id, field.requestedPath).resolved)
+      .map((field) => field.requestedPath)
+
+    if (unresolvedFields.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '保存失败：部分可重复记录尚未创建实例，请刷新后重试',
+        data: { unresolved_paths: unresolvedFields }
+      })
+    }
+
     const saveAll = db.transaction(() => {
       for (const field of flatFields) {
         totalCount++
