@@ -166,7 +166,10 @@ const SchemaEhrTab = ({
 
     if (patientId && !externalSchema) {
       try {
-        await updatePatientEhrSchemaData(patientId, data)
+        const res = await updatePatientEhrSchemaData(patientId, data)
+        if (!res?.success) {
+          throw new Error(res?.message || '保存失败')
+        }
       } catch (err) {
         throw err
       }

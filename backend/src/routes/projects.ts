@@ -1670,6 +1670,27 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     const updatedAt = new Date().toISOString()
     let changedCount = 0
 
+    const unresolvedFields = fields
+      .map((field: any) => {
+        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+        const groupId = String(field?.group_id || '').trim()
+        const fieldKey = String(field?.field_key || '').trim()
+        if (!explicitFieldPath && (!groupId || !fieldKey)) return null
+        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
+        return scope.resolved ? null : requestedFieldPath
+      })
+      .filter((path: string | null): path is string => Boolean(path))
+
+    if (unresolvedFields.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '保存失败：部分可重复记录尚未创建实例，请刷新后重试',
+        data: { unresolved_paths: unresolvedFields },
+      })
+    }
+
     const saveAll = db.transaction(() => {
       for (const field of fields) {
         const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
