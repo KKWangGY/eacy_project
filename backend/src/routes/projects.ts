@@ -1980,8 +1980,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
-
     const stmtDocs = db.prepare(`
       SELECT id
       FROM documents
@@ -2053,6 +2051,14 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
     }
+
+    /**
+     * 仅在所有 CRF 提交请求都成功返回后清理旧 CRF 物化结果。
+     * 否则 CRF 服务不可用、无可提交文档或所有文档已有活跃任务时，会先删掉用户现有 CRF 数据。
+     */
+    const clearedHistory = submittedPatientIds.length > 0
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     db.prepare(`
       INSERT INTO project_extraction_tasks (
