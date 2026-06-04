@@ -109,6 +109,21 @@ interface ResolvedScope {
 }
 
 /**
+ * 构建作用域解析失败响应，阻止可重复字段保存时出现“成功但未落库”的静默丢失。
+ */
+function unresolvedScopeResponse(unresolvedFields: string[]) {
+  return {
+    success: false,
+    code: 409,
+    message: '部分可重复字段无法定位到后端记录实例，请刷新页面后重试',
+    data: {
+      unresolved_fields: unresolvedFields,
+      unresolved_count: unresolvedFields.length,
+    },
+  }
+}
+
+/**
  * 根据请求路径中的索引段，定位唯一的 (section_instance_id, row_instance_id)。
  *
  * 物化侧的约定（crf-service/app/core/materializer.py）：
@@ -488,6 +503,12 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     }
     flatten(newData)
 
+    const unresolvedFields = flatFields
+      .filter((field) => !resolveScopeFromPath(instance.id, field.requestedPath).resolved)
+      .map((field) => field.requestedPath)
+    if (unresolvedFields.length > 0) {
+      return res.status(409).json(unresolvedScopeResponse(unresolvedFields))
+    }
 
     const insertCandidate = db.prepare(`
       INSERT INTO field_value_candidates
@@ -532,7 +553,6 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
       for (const field of flatFields) {
         totalCount++
         const scope = resolveScopeFromPath(instance.id, field.requestedPath)
-        if (!scope.resolved) continue
 
         const oldRow = db.prepare(`
           SELECT selected_value_json FROM field_value_selected
