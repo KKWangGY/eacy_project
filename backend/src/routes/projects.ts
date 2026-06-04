@@ -1161,6 +1161,21 @@ function resolveProjectFieldScope(instanceId: string, rawPath: string): {
 }
 
 /**
+ * 构建作用域解析失败响应，避免项目 CRF 可重复字段保存时被静默丢弃。
+ */
+function unresolvedProjectScopeResponse(unresolvedFields: string[]) {
+  return {
+    success: false,
+    code: 409,
+    message: '部分可重复字段无法定位到后端记录实例，请刷新页面后重试',
+    data: {
+      unresolved_fields: unresolvedFields,
+      unresolved_count: unresolvedFields.length,
+    },
+  }
+}
+
+/**
  * PATCH /api/v1/projects/:projectId
  * 更新科研项目基础信息。
  */
@@ -1629,6 +1644,21 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       instanceId = instance.id
     }
 
+    const unresolvedFields = fields
+      .map((field: any) => {
+        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+        const groupId = String(field?.group_id || '').trim()
+        const fieldKey = String(field?.field_key || '').trim()
+        if (!explicitFieldPath && (!groupId || !fieldKey)) return null
+        return explicitFieldPath || `${groupId}/${fieldKey}`
+      })
+      .filter((fieldPath: string | null): fieldPath is string => Boolean(fieldPath))
+      .filter((fieldPath: string) => !resolveProjectFieldScope(instanceId, fieldPath).resolved)
+
+    if (unresolvedFields.length > 0) {
+      return res.status(409).json(unresolvedProjectScopeResponse(unresolvedFields))
+    }
+
     const upsertSelected = db.prepare(`
       INSERT INTO field_value_selected
         (id, instance_id, section_instance_id, row_instance_id, field_path,
@@ -1680,7 +1710,6 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
         const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
         const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
         const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
