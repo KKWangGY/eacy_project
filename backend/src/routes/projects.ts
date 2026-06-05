@@ -683,6 +683,14 @@ function clearProjectCrfHistoryForPatients(projectId: string, schemaId: string, 
   }
 }
 
+/**
+ * 判断本次项目抽取是否应清理旧 CRF 历史。
+ * 只有全量重抽会覆盖历史；增量/靶向补抽必须保留现有字段值。
+ */
+export function shouldClearProjectCrfHistory(mode: string, submittedJobIds: string[]) {
+  return String(mode || '').toLowerCase() === 'full' && submittedJobIds.length > 0
+}
+
 function summarizeProjectTask(taskRow: any) {
   if (!taskRow) return null
   const jobIds = normalizeStringList(parseJsonArray(taskRow.job_ids_json))
@@ -1939,7 +1947,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     }
 
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>
-    const mode = String(body.mode || 'incremental').trim() || 'incremental'
+    const mode = (String(body.mode || 'incremental').trim() || 'incremental').toLowerCase()
     const targetGroups = normalizeStringList(body.target_groups)
     const { schemaJson, fieldGroups } = getProjectTemplateMeta(proj.schema_id)
     const { targetSections, unresolved } = resolveTargetSections(targetGroups, schemaJson, fieldGroups)
@@ -1979,8 +1987,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2053,6 +2059,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
     }
+
+    const clearedHistory = shouldClearProjectCrfHistory(mode, submittedJobIds)
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     db.prepare(`
       INSERT INTO project_extraction_tasks (
