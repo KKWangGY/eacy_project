@@ -2,6 +2,10 @@ import { Router, Request, Response } from 'express'
 import { randomUUID } from 'crypto'
 import db from '../db.js'
 import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
+import {
+  decideProjectCrfHistoryClearance,
+  normalizeProjectExtractionMode,
+} from './projectExtractionPolicy.js'
 
 const router = Router()
 
@@ -1939,7 +1943,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     }
 
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>
-    const mode = String(body.mode || 'incremental').trim() || 'incremental'
+    const mode = normalizeProjectExtractionMode(body.mode)
     const targetGroups = normalizeStringList(body.target_groups)
     const { schemaJson, fieldGroups } = getProjectTemplateMeta(proj.schema_id)
     const { targetSections, unresolved } = resolveTargetSections(targetGroups, schemaJson, fieldGroups)
@@ -1979,8 +1983,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2054,6 +2056,15 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedDocumentIds.push(...docIds)
     }
 
+    const clearDecision = decideProjectCrfHistoryClearance({
+      mode,
+      targetSections,
+      submittedPatientIds,
+    })
+    const clearedHistory = clearDecision.shouldClear
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, clearDecision.patientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
+
     db.prepare(`
       INSERT INTO project_extraction_tasks (
         id, project_id, schema_id, status, mode, target_groups_json, patient_ids_json,
@@ -2076,6 +2087,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
         target_sections: targetSections,
         unresolved_target_groups: unresolved,
         cleared_history: clearedHistory,
+        clear_history_decision: clearDecision.reason,
         skipped_patients: skippedPatients,
       }),
       startedAt,
@@ -2097,6 +2109,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
         submitted_patient_count: submittedPatientIds.length,
         submitted_document_count: submittedDocumentIds.length,
         cleared_history: clearedHistory,
+        clear_history_decision: clearDecision.reason,
         skipped_patients: skippedPatients,
         active_task: task,
       },
