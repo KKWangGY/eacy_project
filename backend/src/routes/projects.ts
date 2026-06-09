@@ -1100,6 +1100,34 @@ function stripProjectFieldPathIndices(rawPath: string): string {
     .join('/')
 }
 
+/**
+ * 判断字段路径是否包含重复项索引。
+ */
+function hasProjectFieldPathIndices(rawPath: string): boolean {
+  return normalizeProjectFieldPath(rawPath)
+    .split('/')
+    .filter(Boolean)
+    .some((segment) => /^\d+$/.test(segment))
+}
+
+/**
+ * 生成重复项路径无法定位时的统一响应，防止批量保存误报成功。
+ */
+function unresolvedProjectScopeResponse(res: Response, requestedFieldPath: string) {
+  return res.status(409).json({
+    success: false,
+    code: 409,
+    message: '字段路径中的重复项索引无法定位，请刷新项目病例后重试',
+    data: { requested_field_path: requestedFieldPath },
+  })
+}
+
+type ProjectFieldInput = {
+  field: any
+  requestedFieldPath: string
+  fieldPath: string
+}
+
 function resolveProjectFieldScope(instanceId: string, rawPath: string): {
   sectionInstanceId: string | null
   rowInstanceId: string | null
@@ -1606,10 +1634,25 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     }
 
     const body = req.body
-    const fields = Array.isArray(body?.fields) ? body.fields : []
+    const fields: any[] = Array.isArray(body?.fields) ? body.fields : []
     if (fields.length === 0) {
       return res.json({ success: true, code: 0, message: '没有需要保存的字段', data: { changed_fields: 0 } })
     }
+
+    const fieldInputs: ProjectFieldInput[] = fields
+      .map((field: any) => {
+        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+        const groupId = String(field?.group_id || '').trim()
+        const fieldKey = String(field?.field_key || '').trim()
+        if (!explicitFieldPath && (!groupId || !fieldKey)) return null
+        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+        return {
+          field,
+          requestedFieldPath,
+          fieldPath: stripProjectFieldPathIndices(requestedFieldPath),
+        }
+      })
+      .filter((field): field is ProjectFieldInput => Boolean(field))
 
     // 查找或创建 project_crf schema_instance
     let instance = db.prepare(`
@@ -1620,6 +1663,10 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
     let instanceId: string
     if (!instance) {
+      const indexedField = fieldInputs.find((field) => hasProjectFieldPathIndices(field.requestedFieldPath))
+      if (indexedField) {
+        return unresolvedProjectScopeResponse(res, indexedField.requestedFieldPath)
+      }
       instanceId = randomUUID()
       db.prepare(`
         INSERT INTO schema_instances (id, patient_id, schema_id, project_id, name, instance_type, status)
@@ -1627,6 +1674,14 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       `).run(instanceId, patientId, project.schema_id, projectId, `${project.schema_id} / ${projectId} / ${patientId}`)
     } else {
       instanceId = instance.id
+    }
+
+    const unresolvedField = fieldInputs.find((field) => {
+      const scope = resolveProjectFieldScope(instanceId, field.requestedFieldPath)
+      return !scope.resolved
+    })
+    if (unresolvedField) {
+      return unresolvedProjectScopeResponse(res, unresolvedField.requestedFieldPath)
     }
 
     const upsertSelected = db.prepare(`
@@ -1671,17 +1726,9 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     let changedCount = 0
 
     const saveAll = db.transaction(() => {
-      for (const field of fields) {
-        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
-        const groupId = String(field?.group_id || '').trim()
-        const fieldKey = String(field?.field_key || '').trim()
-        if (!explicitFieldPath && (!groupId || !fieldKey)) continue
-
-        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
-        const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
-        const rawValue = field?.value
+      for (const input of fieldInputs) {
+        const scope = resolveProjectFieldScope(instanceId, input.requestedFieldPath)
+        const rawValue = input.field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
           : JSON.stringify(rawValue)
@@ -1697,7 +1744,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
             AND COALESCE(section_instance_id, '__null__') = COALESCE(?, '__null__')
             AND COALESCE(row_instance_id, '__null__') = COALESCE(?, '__null__')
             AND field_path = ?
-        `).get(instanceId, scope.sectionInstanceId, scope.rowInstanceId, fieldPath) as { selected_value_json: string } | undefined
+        `).get(instanceId, scope.sectionInstanceId, scope.rowInstanceId, input.fieldPath) as { selected_value_json: string } | undefined
         if (existing && existing.selected_value_json === valueJson) {
           continue
         }
@@ -1710,7 +1757,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
             instanceId,
             scope.sectionInstanceId,
             scope.rowInstanceId,
-            fieldPath,
+            input.fieldPath,
             valueJson,
             valueType,
             '用户手动编辑',
@@ -1720,7 +1767,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
           insertCandidate.run(
             candidateId,
             instanceId,
-            fieldPath,
+            input.fieldPath,
             valueJson,
             valueType,
             '用户手动编辑',
@@ -1735,12 +1782,12 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
             instanceId,
             scope.sectionInstanceId,
             scope.rowInstanceId,
-            fieldPath,
+            input.fieldPath,
             candidateId,
             valueJson
           )
         } else {
-          upsertSelected.run(randomUUID(), instanceId, fieldPath, candidateId, valueJson)
+          upsertSelected.run(randomUUID(), instanceId, input.fieldPath, candidateId, valueJson)
         }
         changedCount++
       }

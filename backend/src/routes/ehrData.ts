@@ -109,6 +109,18 @@ interface ResolvedScope {
 }
 
 /**
+ * 生成重复项路径无法定位时的统一响应，避免批量保存静默丢弃字段。
+ */
+function unresolvedScopeResponse(res: Response, requestedFieldPath: string) {
+  return res.status(409).json({
+    success: false,
+    code: 409,
+    message: '字段路径中的重复项索引无法定位，请刷新病历夹后重试',
+    data: { requested_field_path: requestedFieldPath },
+  })
+}
+
+/**
  * 根据请求路径中的索引段，定位唯一的 (section_instance_id, row_instance_id)。
  *
  * 物化侧的约定（crf-service/app/core/materializer.py）：
@@ -488,6 +500,13 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     }
     flatten(newData)
 
+    const unresolvedField = flatFields.find((field) => {
+      const scope = resolveScopeFromPath(instance.id, field.requestedPath)
+      return !scope.resolved
+    })
+    if (unresolvedField) {
+      return unresolvedScopeResponse(res, unresolvedField.requestedPath)
+    }
 
     const insertCandidate = db.prepare(`
       INSERT INTO field_value_candidates
@@ -532,7 +551,6 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
       for (const field of flatFields) {
         totalCount++
         const scope = resolveScopeFromPath(instance.id, field.requestedPath)
-        if (!scope.resolved) continue
 
         const oldRow = db.prepare(`
           SELECT selected_value_json FROM field_value_selected
@@ -1404,14 +1422,7 @@ router.post('/:patientId/ehr-field-candidates/select', (req: Request, res: Respo
     const selectedPosition = resolveScopeFromPath(instance.id, rawPathWithSlash)
     const selectedCandidateId = candidate?.id || randomUUID()
 
-    if (!selectedPosition.resolved) {
-      return res.status(409).json({
-        success: false,
-        code: 409,
-        message: '字段路径中的重复项索引无法定位，请刷新病历夹后重试',
-        data: { requested_field_path: rawFieldPath },
-      })
-    }
+    if (!selectedPosition.resolved) return unresolvedScopeResponse(res, rawFieldPath)
 
     if (candidate && selectedPosition.hasIndices) {
       const sameSection = (candidate.section_instance_id || null) === (selectedPosition.sectionInstanceId || null)
