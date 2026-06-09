@@ -1122,6 +1122,12 @@ function unresolvedProjectScopeResponse(res: Response, requestedFieldPath: strin
   })
 }
 
+type ProjectFieldInput = {
+  field: any
+  requestedFieldPath: string
+  fieldPath: string
+}
+
 function resolveProjectFieldScope(instanceId: string, rawPath: string): {
   sectionInstanceId: string | null
   rowInstanceId: string | null
@@ -1628,12 +1634,12 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     }
 
     const body = req.body
-    const fields = Array.isArray(body?.fields) ? body.fields : []
+    const fields: any[] = Array.isArray(body?.fields) ? body.fields : []
     if (fields.length === 0) {
       return res.json({ success: true, code: 0, message: '没有需要保存的字段', data: { changed_fields: 0 } })
     }
 
-    const fieldInputs = fields
+    const fieldInputs: ProjectFieldInput[] = fields
       .map((field: any) => {
         const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
         const groupId = String(field?.group_id || '').trim()
@@ -1646,7 +1652,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
           fieldPath: stripProjectFieldPathIndices(requestedFieldPath),
         }
       })
-      .filter((field): field is { field: any; requestedFieldPath: string; fieldPath: string } => Boolean(field))
+      .filter((field): field is ProjectFieldInput => Boolean(field))
 
     // 查找或创建 project_crf schema_instance
     let instance = db.prepare(`
