@@ -1100,6 +1100,18 @@ function stripProjectFieldPathIndices(rawPath: string): string {
     .join('/')
 }
 
+interface ScopedProjectField {
+  original: any
+  requestedFieldPath: string
+  fieldPath: string
+  scope: {
+    sectionInstanceId: string | null
+    rowInstanceId: string | null
+    hasIndices: boolean
+    resolved: boolean
+  }
+}
+
 function resolveProjectFieldScope(instanceId: string, rawPath: string): {
   sectionInstanceId: string | null
   rowInstanceId: string | null
@@ -1670,18 +1682,37 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
     const updatedAt = new Date().toISOString()
     let changedCount = 0
 
-    const saveAll = db.transaction(() => {
-      for (const field of fields) {
-        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
-        const groupId = String(field?.group_id || '').trim()
-        const fieldKey = String(field?.field_key || '').trim()
-        if (!explicitFieldPath && (!groupId || !fieldKey)) continue
+    const scopedFields: ScopedProjectField[] = []
+    for (const field of fields) {
+      const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+      const groupId = String(field?.group_id || '').trim()
+      const fieldKey = String(field?.field_key || '').trim()
+      if (!explicitFieldPath && (!groupId || !fieldKey)) continue
 
-        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
-        const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
-        const rawValue = field?.value
+      const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+      scopedFields.push({
+        original: field,
+        requestedFieldPath,
+        fieldPath: stripProjectFieldPathIndices(requestedFieldPath),
+        scope: resolveProjectFieldScope(instanceId, requestedFieldPath),
+      })
+    }
+
+    const unresolvedPaths = scopedFields
+      .filter((field) => !field.scope.resolved)
+      .map((field) => field.requestedFieldPath)
+    if (unresolvedPaths.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '部分字段路径无法匹配到可重复项实例，保存已取消',
+        data: { unresolved_paths: unresolvedPaths },
+      })
+    }
+
+    const saveAll = db.transaction(() => {
+      for (const field of scopedFields) {
+        const rawValue = field.original?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
           : JSON.stringify(rawValue)
@@ -1697,20 +1728,20 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
             AND COALESCE(section_instance_id, '__null__') = COALESCE(?, '__null__')
             AND COALESCE(row_instance_id, '__null__') = COALESCE(?, '__null__')
             AND field_path = ?
-        `).get(instanceId, scope.sectionInstanceId, scope.rowInstanceId, fieldPath) as { selected_value_json: string } | undefined
+        `).get(instanceId, field.scope.sectionInstanceId, field.scope.rowInstanceId, field.fieldPath) as { selected_value_json: string } | undefined
         if (existing && existing.selected_value_json === valueJson) {
           continue
         }
 
         // 写入候选值
         const candidateId = randomUUID()
-        if (scope.sectionInstanceId || scope.rowInstanceId) {
+        if (field.scope.sectionInstanceId || field.scope.rowInstanceId) {
           insertScopedCandidate.run(
             candidateId,
             instanceId,
-            scope.sectionInstanceId,
-            scope.rowInstanceId,
-            fieldPath,
+            field.scope.sectionInstanceId,
+            field.scope.rowInstanceId,
+            field.fieldPath,
             valueJson,
             valueType,
             '用户手动编辑',
@@ -1720,7 +1751,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
           insertCandidate.run(
             candidateId,
             instanceId,
-            fieldPath,
+            field.fieldPath,
             valueJson,
             valueType,
             '用户手动编辑',
@@ -1729,18 +1760,18 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
         }
 
         // 写入选中值
-        if (scope.sectionInstanceId || scope.rowInstanceId) {
+        if (field.scope.sectionInstanceId || field.scope.rowInstanceId) {
           upsertScopedSelected.run(
             randomUUID(),
             instanceId,
-            scope.sectionInstanceId,
-            scope.rowInstanceId,
-            fieldPath,
+            field.scope.sectionInstanceId,
+            field.scope.rowInstanceId,
+            field.fieldPath,
             candidateId,
             valueJson
           )
         } else {
-          upsertSelected.run(randomUUID(), instanceId, fieldPath, candidateId, valueJson)
+          upsertSelected.run(randomUUID(), instanceId, field.fieldPath, candidateId, valueJson)
         }
         changedCount++
       }
@@ -1757,7 +1788,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       success: true,
       code: 0,
       message: '保存成功',
-      data: { changed_fields: changedCount, total_fields: fields.length },
+      data: { changed_fields: changedCount, total_fields: scopedFields.length },
     })
   } catch (err: any) {
     console.error('[PATCH crf/fields]', err)
