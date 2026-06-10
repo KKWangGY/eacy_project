@@ -42,8 +42,8 @@ function testPageSizeFallbackIsolation() {
   ])
 
   const crossDoc = parseSourceLocationWithFallback(bareBox, 1, 'doc-a', fallback) as any
-  assert.equal(crossDoc.page_width, undefined)
-  assert.equal(crossDoc.page_height, undefined)
+  assert.equal(crossDoc.page_width, null)
+  assert.equal(crossDoc.page_height, null)
 
   const sameDocFallback = buildPageSizeFallback([
     {
