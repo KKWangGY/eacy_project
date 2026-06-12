@@ -52,10 +52,17 @@ test_files/
 
 # Logs and databases
 *.log
+*.jsonl
+*.db
+*.db-*
+*.db.backup.*
+*.db.bak.*
 *.sqlite
 *.sqlite3
 celerybeat-schedule
 celerybeat.pid
+backend/uploads/
+crf-service/logs/
 
 # Python project specific
 build/
