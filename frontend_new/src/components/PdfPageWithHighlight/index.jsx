@@ -21,6 +21,15 @@ if (typeof window !== 'undefined') {
 
 const DEFAULT_BBOX_SCALE = 1000
 
+/**
+ * 判断 TextIn position 是否为 0..1 单位坐标。
+ * @param {number[]} values
+ * @returns {boolean}
+ */
+function isUnitNormalizedPolygon(values) {
+  return values.every((value) => Number.isFinite(value) && value >= 0 && value <= 1)
+}
+
 export function PdfPageWithHighlight({
   pdfUrl,
   pageNumber = null,
@@ -246,7 +255,10 @@ export function PdfPageWithHighlight({
       const origW = item.page_width
       const origH = item.page_height
       if (origW > 0 && origH > 0) {
-        return pts.map((p) => ({ x: (p.x / origW) * refW, y: (p.y / origH) * refH }))
+        const polygonPts = isUnitNormalizedPolygon(raw)
+          ? pts.map((p) => ({ x: p.x * origW, y: p.y * origH }))
+          : pts
+        return polygonPts.map((p) => ({ x: (p.x / origW) * refW, y: (p.y / origH) * refH }))
       }
       // 自动检测：bbox 明显超 PDF 页 → 推断原图尺寸
       const xs = pts.map((p) => Math.abs(p.x))
