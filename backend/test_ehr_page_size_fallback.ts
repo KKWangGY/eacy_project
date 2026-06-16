@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { buildPageSizeFallback, parseSourceLocationWithFallback } from './src/routes/ehrData.js'
+import { buildPageSizeFallback, parseSourceLocationWithFallback } from './src/routes/ehrDataPageSizeFallback.js'
 
 const rows = [
   {
