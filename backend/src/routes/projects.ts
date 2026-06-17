@@ -683,6 +683,20 @@ function clearProjectCrfHistoryForPatients(projectId: string, schemaId: string, 
   }
 }
 
+/**
+ * 判断一次项目 CRF 抽取是否允许清空既有物化结果。
+ *
+ * 只有完整重跑才需要清空旧实例；增量/靶向抽取必须保留已有字段，避免在
+ * 新任务失败或只覆盖局部字段时丢失科研数据。
+ */
+export function shouldClearProjectCrfHistory(options: {
+  mode: string | null | undefined
+  targetSections: string[]
+}): boolean {
+  const normalizedMode = String(options.mode || '').trim().toLowerCase()
+  return normalizedMode === 'full' && options.targetSections.length === 0
+}
+
 function summarizeProjectTask(taskRow: any) {
   if (!taskRow) return null
   const jobIds = normalizeStringList(parseJsonArray(taskRow.job_ids_json))
@@ -1939,7 +1953,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     }
 
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>
-    const mode = String(body.mode || 'incremental').trim() || 'incremental'
+    const mode = (String(body.mode || 'incremental').trim() || 'incremental').toLowerCase()
     const targetGroups = normalizeStringList(body.target_groups)
     const { schemaJson, fieldGroups } = getProjectTemplateMeta(proj.schema_id)
     const { targetSections, unresolved } = resolveTargetSections(targetGroups, schemaJson, fieldGroups)
@@ -1980,7 +1994,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
+    let clearedHistory = { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2052,6 +2066,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedPatientIds.push(patientId)
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
+    }
+
+    if (shouldClearProjectCrfHistory({ mode, targetSections }) && submittedPatientIds.length > 0) {
+      clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
     }
 
     db.prepare(`
