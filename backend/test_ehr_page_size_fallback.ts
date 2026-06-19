@@ -28,8 +28,8 @@ function run() {
     'doc-a',
     fallback
   ) as any
-  assert.equal(docALoc.page_width, undefined)
-  assert.equal(docALoc.page_height, undefined)
+  assert.equal(docALoc.page_width, null)
+  assert.equal(docALoc.page_height, null)
 
   const docBLoc = __ehrDataTest.parseSourceLocationWithFallback(
     JSON.stringify({ bbox: [100, 200, 300, 400] }),
