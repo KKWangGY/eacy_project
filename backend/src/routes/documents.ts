@@ -127,6 +127,19 @@ function inferSingleProjectForPatient(patientId: string | null | undefined): { p
   return rows.length === 1 ? rows[0] : null
 }
 
+/**
+ * 校验患者是否确实入组指定项目，防止单文档抽取把证据物化到无关项目 CRF。
+ */
+function isPatientEnrolledInProject(projectId: string, patientId: string): boolean {
+  const row = db.prepare(`
+    SELECT 1 AS hit
+    FROM project_patients
+    WHERE project_id = ? AND patient_id = ?
+    LIMIT 1
+  `).get(projectId, patientId) as { hit: number } | undefined
+  return !!row
+}
+
 /** 从 ehr_extraction_jobs 获取文档的最新 job 状态 */
 function getJobStatus(documentId: string, jobType: string): string {
   const row = db.prepare(`
@@ -1712,15 +1725,36 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
     })
   }
 
-  const patientId = req.body.patient_id || row.patient_id;
-  if (!patientId) {
+  const boundPatientId = row.patient_id ? String(row.patient_id).trim() : ''
+  const requestedPatientId = req.body?.patient_id == null ? '' : String(req.body.patient_id).trim()
+  if (!boundPatientId) {
     return res.status(400).json({ success: false, code: 400, message: '无可用的 patient_id 绑定', data: null })
+  }
+  if (requestedPatientId && requestedPatientId !== boundPatientId) {
+    return res.status(400).json({
+      success: false,
+      code: 400,
+      message: '请求的 patient_id 与文档绑定患者不一致',
+      data: { document_id: String(req.params.id), bound_patient_id: boundPatientId },
+    })
   }
 
   const meta = safeParseMetadata(row.metadata)
-  let requestedProjectId = String(req.body.project_id || meta.project_id || '').trim() || null
+  const requestedInstanceType = req.body?.instance_type == null ? '' : String(req.body.instance_type).trim()
+  const explicitProjectId = req.body?.project_id == null ? '' : String(req.body.project_id).trim()
+  const metadataProjectId = meta.project_id == null ? '' : String(meta.project_id).trim()
+  let requestedProjectId = explicitProjectId || metadataProjectId || null
   let schemaId = req.body.schema_id || null
-  let instanceType = req.body.instance_type || null
+  let instanceType = requestedInstanceType || null
+
+  if (requestedInstanceType === 'project_crf' && !requestedProjectId) {
+    return res.status(400).json({
+      success: false,
+      code: 400,
+      message: 'project_crf 抽取必须指定 project_id',
+      data: null,
+    })
+  }
 
   if (requestedProjectId) {
     const proj = db.prepare(`SELECT schema_id FROM projects WHERE id = ?`).get(requestedProjectId) as { schema_id?: string } | undefined
@@ -1732,8 +1766,16 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
         data: { project_id: requestedProjectId },
       })
     }
-    schemaId = schemaId || proj.schema_id
-    instanceType = instanceType || 'project_crf'
+    if (!isPatientEnrolledInProject(requestedProjectId, boundPatientId)) {
+      return res.status(403).json({
+        success: false,
+        code: 403,
+        message: '文档绑定患者未入组该项目，无法进行科研抽取',
+        data: { project_id: requestedProjectId, patient_id: boundPatientId },
+      })
+    }
+    schemaId = proj.schema_id
+    instanceType = 'project_crf'
   }
 
   schemaId = schemaId || getDefaultSchemaId();
@@ -1747,7 +1789,7 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
   const targetSection = req.body.target_section || null;
   try {
     const payload: Record<string, unknown> = {
-      patient_id: patientId,
+      patient_id: boundPatientId,
       schema_id: schemaId,
       document_ids: [String(req.params.id)],
       instance_type: instanceType || 'patient_ehr',

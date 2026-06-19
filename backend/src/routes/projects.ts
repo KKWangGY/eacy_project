@@ -683,6 +683,22 @@ function clearProjectCrfHistoryForPatients(projectId: string, schemaId: string, 
   }
 }
 
+/**
+ * 判断本次项目 CRF 抽取是否允许清空历史。
+ *
+ * 只有明确的全量、非靶向抽取才会重建整份 CRF；增量抽取、靶向字段组抽取
+ * 或没有成功提交任务时清空历史都会造成已有 CRF 数据丢失。
+ */
+export function shouldClearProjectCrfHistory(
+  mode: string,
+  targetSections: string[],
+  submittedPatientIds: string[]
+): boolean {
+  return String(mode || '').trim().toLowerCase() === 'full' &&
+    targetSections.length === 0 &&
+    submittedPatientIds.length > 0
+}
+
 function summarizeProjectTask(taskRow: any) {
   if (!taskRow) return null
   const jobIds = normalizeStringList(parseJsonArray(taskRow.job_ids_json))
@@ -1939,7 +1955,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     }
 
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>
-    const mode = String(body.mode || 'incremental').trim() || 'incremental'
+    const mode = String(body.mode || 'incremental').trim().toLowerCase() || 'incremental'
     const targetGroups = normalizeStringList(body.target_groups)
     const { schemaJson, fieldGroups } = getProjectTemplateMeta(proj.schema_id)
     const { targetSections, unresolved } = resolveTargetSections(targetGroups, schemaJson, fieldGroups)
@@ -1979,8 +1995,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2053,6 +2067,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
     }
+
+    const clearedHistory = shouldClearProjectCrfHistory(mode, targetSections, submittedPatientIds)
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     db.prepare(`
       INSERT INTO project_extraction_tasks (
