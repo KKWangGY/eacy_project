@@ -54,8 +54,15 @@ test_files/
 *.log
 *.sqlite
 *.sqlite3
+*.db
+*.db-*
+*.db.*
 celerybeat-schedule
 celerybeat.pid
+
+# EACY runtime artifacts (may contain PHI or extraction prompts/results)
+backend/uploads/
+crf-service/logs/
 
 # Python project specific
 build/
