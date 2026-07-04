@@ -8,6 +8,35 @@ import db from '../db.js'
 
 const router = Router()
 
+/**
+ * 判断文档是否已经进入新抽取物化流水线。
+ *
+ * 遗留 merge-ehr 会直接 flatten documents.extract_result_json 并覆盖 selected 值；
+ * 一旦 extraction_runs 或候选值已经存在，就应由物化层维护数据，避免重复写入和覆盖用户选择。
+ */
+function hasMaterializedExtractionForDocument(documentId: string, patientId: string): boolean {
+  const run = db.prepare(`
+    SELECT 1
+    FROM extraction_runs er
+    JOIN schema_instances si ON si.id = er.instance_id
+    WHERE er.document_id = ?
+      AND si.patient_id = ?
+      AND er.status IN ('pending', 'running', 'succeeded')
+    LIMIT 1
+  `).get(documentId, patientId) as any
+  if (run) return true
+
+  const candidate = db.prepare(`
+    SELECT 1
+    FROM field_value_candidates fvc
+    JOIN schema_instances si ON si.id = fvc.instance_id
+    WHERE fvc.source_document_id = ?
+      AND si.patient_id = ?
+    LIMIT 1
+  `).get(documentId, patientId) as any
+  return !!candidate
+}
+
 function parseStoredValue(raw: string) {
   try {
     return JSON.parse(raw)
@@ -798,14 +827,33 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
 router.post('/:patientId/merge-ehr', (req: Request, res: Response) => {
   try {
     const { patientId } = req.params
-    const { document_id, source_extraction_id } = req.body
+    const { document_id } = req.body
 
     if (!document_id) {
       return res.status(400).json({ success: false, code: 400, message: '缺少 document_id', data: null })
     }
 
     // 1. 获取文档的 extract_result_json
-    const doc = db.prepare(`SELECT extract_result_json FROM documents WHERE id = ?`).get(document_id) as any
+    const doc = db.prepare(`SELECT patient_id, status, extract_result_json FROM documents WHERE id = ?`).get(document_id) as any
+    if (!doc || doc.status === 'deleted') {
+      return res.status(404).json({ success: false, code: 404, message: '文档不存在', data: null })
+    }
+    if (doc.patient_id && String(doc.patient_id) !== String(patientId)) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '文档绑定患者与目标患者不一致，已拒绝合并以避免跨患者写入',
+        data: { document_id, bound_patient_id: doc.patient_id, target_patient_id: patientId }
+      })
+    }
+    if (hasMaterializedExtractionForDocument(String(document_id), String(patientId))) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '该文档抽取结果已由自动物化流水线写入病历夹，无需再次合并',
+        data: { document_id, patient_id: patientId }
+      })
+    }
     if (!doc?.extract_result_json) {
       return res.status(400).json({
         success: false, code: 400,
