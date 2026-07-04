@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import app from './src/app.js'
-import db from './src/db.js'
+import { fileURLToPath } from 'node:url'
+import type Database from 'better-sqlite3'
 
 const prefix = `guard_${Date.now()}_${randomUUID().slice(0, 8)}`
 const ids = {
@@ -17,6 +20,36 @@ const ids = {
   run: `${prefix}_run`,
   candidate: `${prefix}_candidate`,
   selected: `${prefix}_selected`,
+}
+const backendDir = path.dirname(fileURLToPath(import.meta.url))
+const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eacy-db-guard-'))
+const databaseFiles = ['eacy.db', 'eacy.db-shm', 'eacy.db-wal']
+const backedUpFiles = new Set<string>()
+
+/**
+ * 备份仓库中的运行时数据库文件，测试结束后原样恢复，避免测试污染 git 工作区。
+ */
+function backupDatabaseFiles() {
+  for (const fileName of databaseFiles) {
+    const source = path.join(backendDir, fileName)
+    if (!fs.existsSync(source)) continue
+    fs.copyFileSync(source, path.join(backupDir, fileName))
+    backedUpFiles.add(fileName)
+  }
+}
+
+/**
+ * 恢复测试前的数据库文件状态。
+ */
+function restoreDatabaseFiles() {
+  for (const fileName of databaseFiles) {
+    const target = path.join(backendDir, fileName)
+    if (fs.existsSync(target)) fs.unlinkSync(target)
+    if (backedUpFiles.has(fileName)) {
+      fs.copyFileSync(path.join(backupDir, fileName), target)
+    }
+  }
+  fs.rmSync(backupDir, { recursive: true, force: true })
 }
 
 /**
@@ -34,7 +67,7 @@ async function request(baseUrl: string, method: string, path: string, body?: unk
 /**
  * 清除本脚本写入的临时数据。
  */
-function cleanup() {
+function cleanup(db: Database.Database) {
   db.prepare(`DELETE FROM field_value_selected WHERE id = ? OR instance_id = ?`).run(ids.selected, ids.instance)
   db.prepare(`DELETE FROM field_value_candidates WHERE id = ? OR instance_id = ?`).run(ids.candidate, ids.instance)
   db.prepare(`DELETE FROM extraction_runs WHERE id = ? OR instance_id = ?`).run(ids.run, ids.instance)
@@ -49,7 +82,7 @@ function cleanup() {
 /**
  * 建立抽取归属校验所需的最小数据库夹具。
  */
-function seed() {
+function seed(db: Database.Database) {
   const ts = new Date().toISOString()
   db.prepare(`
     INSERT INTO schemas (id, name, code, schema_type, version, content_json, is_active, created_at, updated_at)
@@ -96,8 +129,14 @@ function seed() {
 }
 
 async function run() {
-  cleanup()
-  seed()
+  backupDatabaseFiles()
+  const [{ default: app }, { default: db }] = await Promise.all([
+    import('./src/app.js'),
+    import('./src/db.js'),
+  ])
+
+  cleanup(db)
+  seed(db)
 
   const server = http.createServer(app)
   await new Promise<void>((resolve) => server.listen(0, resolve))
@@ -141,12 +180,14 @@ async function run() {
     console.log('document extraction guard tests passed')
   } finally {
     await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()))
-    cleanup()
+    cleanup(db)
+    db.close()
+    restoreDatabaseFiles()
   }
 }
 
 run().catch((error) => {
-  cleanup()
+  restoreDatabaseFiles()
   console.error(error)
   process.exit(1)
 })
