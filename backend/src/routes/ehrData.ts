@@ -804,11 +804,11 @@ router.get('/:patientId/ehr-field-history', (req: Request, res: Response) => {
  */
 router.post('/:patientId/merge-ehr', (req: Request, res: Response) => {
   try {
-    const { patientId } = req.params
+    const patientId = String(req.params.patientId || '').trim()
     const { document_id, source_extraction_id } = req.body
 
-    if (!document_id) {
-      return res.status(400).json({ success: false, code: 400, message: '缺少 document_id', data: null })
+    if (!patientId || !document_id) {
+      return res.status(400).json({ success: false, code: 400, message: patientId ? '缺少 document_id' : '缺少 patientId', data: null })
     }
 
     /**
