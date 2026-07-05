@@ -90,6 +90,13 @@ function buildSelectableCandidateFieldPaths(rawFieldPath: string): string[] {
   return [...new Set(pathsToTry)]
 }
 
+/**
+ * 判断文档是否允许合并进当前患者病历。
+ */
+export function canMergeDocumentIntoPatient(documentPatientId: unknown, currentPatientId: string) {
+  return String(documentPatientId || '').trim() === String(currentPatientId || '').trim()
+}
+
 function buildFieldPathSuffixes(paths: string[]): string[] {
   const suffixes: string[] = []
   for (const path of paths) {
@@ -804,8 +811,21 @@ router.post('/:patientId/merge-ehr', (req: Request, res: Response) => {
       return res.status(400).json({ success: false, code: 400, message: '缺少 document_id', data: null })
     }
 
-    // 1. 获取文档的 extract_result_json
-    const doc = db.prepare(`SELECT extract_result_json FROM documents WHERE id = ?`).get(document_id) as any
+    /**
+     * 旧版合并入口只能读取当前患者自己的文档，避免跨患者污染病历与证据来源。
+     */
+    const doc = db.prepare(`
+      SELECT extract_result_json, patient_id
+      FROM documents
+      WHERE id = ? AND status != 'deleted'
+    `).get(document_id) as any
+    if (!doc || !canMergeDocumentIntoPatient(doc.patient_id, patientId)) {
+      return res.status(404).json({
+        success: false, code: 404,
+        message: '文档不存在或不属于该患者',
+        data: null
+      })
+    }
     if (!doc?.extract_result_json) {
       return res.status(400).json({
         success: false, code: 400,
