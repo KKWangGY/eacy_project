@@ -683,6 +683,21 @@ function clearProjectCrfHistoryForPatients(projectId: string, schemaId: string, 
   }
 }
 
+/**
+ * 判断项目 CRF 抽取是否允许删除既有历史。
+ *
+ * 只有显式全量重建且没有定向字段组时才清理；增量/定向抽取必须保留未覆盖字段。
+ */
+export function shouldClearProjectCrfHistory(
+  mode: string,
+  targetSections: string[],
+  submittedPatientIds: string[],
+) {
+  return String(mode || '').trim().toLowerCase() === 'full'
+    && targetSections.length === 0
+    && submittedPatientIds.length > 0
+}
+
 function summarizeProjectTask(taskRow: any) {
   if (!taskRow) return null
   const jobIds = normalizeStringList(parseJsonArray(taskRow.job_ids_json))
@@ -1951,13 +1966,24 @@ async function handleCrfExtraction(req: Request, res: Response) {
         data: { target_groups: targetGroups, unresolved_target_groups: unresolved },
       })
     }
+    const enrolledRows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
+    const enrolledPatientIds = normalizeStringList(enrolledRows.map((r) => r.patient_id))
+    const enrolledPatientSet = new Set(enrolledPatientIds)
     let targetPatients: string[] = []
 
     if (Array.isArray(body.patient_ids) && body.patient_ids.length > 0) {
       targetPatients = normalizeStringList(body.patient_ids)
+      const invalidPatientIds = targetPatients.filter((patientId) => !enrolledPatientSet.has(patientId))
+      if (invalidPatientIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          code: 400,
+          message: '患者未加入该项目，不能发起项目 CRF 抽取',
+          data: { invalid_patient_ids: invalidPatientIds },
+        })
+      }
     } else {
-      const rows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
-      targetPatients = normalizeStringList(rows.map((r) => r.patient_id))
+      targetPatients = enrolledPatientIds
     }
 
     if (targetPatients.length === 0) {
@@ -1979,8 +2005,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2053,6 +2077,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
     }
+
+    const clearedHistory = shouldClearProjectCrfHistory(mode, targetSections, submittedPatientIds)
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     db.prepare(`
       INSERT INTO project_extraction_tasks (
