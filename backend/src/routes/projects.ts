@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { randomUUID } from 'crypto'
 import db from '../db.js'
 import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
+import { shouldClearProjectCrfHistory } from '../utils/projectExtractionPolicy.js'
 
 const router = Router()
 
@@ -1980,7 +1981,8 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
+    const shouldClearHistory = shouldClearProjectCrfHistory({ mode, targetGroups, targetSections })
+    let clearedHistory = { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2052,6 +2054,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedPatientIds.push(patientId)
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
+    }
+
+    if (shouldClearHistory && submittedPatientIds.length > 0) {
+      clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
     }
 
     db.prepare(`
