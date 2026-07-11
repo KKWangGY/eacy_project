@@ -488,6 +488,22 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     }
     flatten(newData)
 
+    const scopedFields = flatFields.map((field) => ({
+      ...field,
+      scope: resolveScopeFromPath(instance.id, field.requestedPath),
+    }))
+    const unresolvedFieldPaths = scopedFields
+      .filter((field) => !field.scope.resolved)
+      .map((field) => field.requestedPath)
+    if (unresolvedFieldPaths.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '部分字段路径无法定位到对应的可重复行，请刷新后重试',
+        data: { unresolved_paths: unresolvedFieldPaths }
+      })
+    }
+
 
     const insertCandidate = db.prepare(`
       INSERT INTO field_value_candidates
@@ -529,10 +545,9 @@ router.put('/:patientId/ehr-schema-data', (req: Request, res: Response) => {
     let totalCount = 0
 
     const saveAll = db.transaction(() => {
-      for (const field of flatFields) {
+      for (const field of scopedFields) {
         totalCount++
-        const scope = resolveScopeFromPath(instance.id, field.requestedPath)
-        if (!scope.resolved) continue
+        const { scope } = field
 
         const oldRow = db.prepare(`
           SELECT selected_value_json FROM field_value_selected
@@ -1036,22 +1051,17 @@ interface PageSize {
 
 interface PageSizeFallback {
   byDocPage: Map<string, PageSize>
-  globalAny: PageSize | null
 }
 
 /**
  * 收集 rows 中已知的 OCR 原图尺寸，按 (source_document_id, source_page) 建立查找表，
- * 同时记录任意一份"已知尺寸"作为兜底。
  *
  * 用于回填仅存裸 bbox（page_width/page_height 缺失）的老候选数据：
- *   1) 优先用同一 (doc_id, page) 下其它候选的尺寸；
- *   2) 同文档没有可用尺寸时，回落到本次请求范围内任意已知尺寸。
- *      这是因为前端常在同一字段下混展多个文档候选，只要有一个候选携带了
- *      原图尺寸，前端就能正确缩放（同 PDF 同 OCR 提供商，分辨率几乎一致）。
+ * 只允许使用同一 (doc_id, page) 下其它候选的尺寸，避免把另一个文档的 OCR
+ * 分辨率套到当前证据上，导致 PDF 溯源红框严重错位。
  */
 function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
   const byDocPage = new Map<string, PageSize>()
-  let globalAny: PageSize | null = null
   for (const r of rows) {
     if (!r?.source_bbox_json) continue
     const loc = parseSourceLocation(r.source_bbox_json, r.source_page) as any
@@ -1068,10 +1078,9 @@ function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
         const key = `${r.source_document_id}:${r.source_page ?? ''}`
         if (!byDocPage.has(key)) byDocPage.set(key, { page_width: pw, page_height: ph })
       }
-      if (!globalAny) globalAny = { page_width: pw, page_height: ph }
     }
   }
-  return { byDocPage, globalAny }
+  return { byDocPage }
 }
 
 /**
@@ -1092,9 +1101,6 @@ function parseSourceLocationWithFallback(
   if (docId) {
     const fb = fallback.byDocPage.get(`${docId}:${page ?? ''}`)
     if (fb) return { ...loc, page_width: fb.page_width, page_height: fb.page_height }
-  }
-  if (fallback.globalAny) {
-    return { ...loc, page_width: fallback.globalAny.page_width, page_height: fallback.globalAny.page_height }
   }
   return loc
 }

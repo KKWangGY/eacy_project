@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { randomUUID } from 'crypto'
 import db from '../db.js'
 import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
+import { shouldClearProjectCrfHistory } from '../utils/projectExtractionPolicy.js'
 
 const router = Router()
 
@@ -1667,20 +1668,43 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user')
     `)
 
+    const scopedFields: Array<{
+      field: any
+      fieldPath: string
+      scope: ReturnType<typeof resolveProjectFieldScope>
+    }> = []
+    const unresolvedFieldPaths: string[] = []
+    for (const field of fields) {
+      const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+      const groupId = String(field?.group_id || '').trim()
+      const fieldKey = String(field?.field_key || '').trim()
+      if (!explicitFieldPath && (!groupId || !fieldKey)) continue
+
+      const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+      const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
+      const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
+      if (!scope.resolved) {
+        unresolvedFieldPaths.push(requestedFieldPath)
+        continue
+      }
+      scopedFields.push({ field, fieldPath, scope })
+    }
+
+    if (unresolvedFieldPaths.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '部分字段路径无法定位到对应的可重复行，请刷新后重试',
+        data: { unresolved_paths: unresolvedFieldPaths },
+      })
+    }
+
     const updatedAt = new Date().toISOString()
     let changedCount = 0
 
     const saveAll = db.transaction(() => {
-      for (const field of fields) {
-        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
-        const groupId = String(field?.group_id || '').trim()
-        const fieldKey = String(field?.field_key || '').trim()
-        if (!explicitFieldPath && (!groupId || !fieldKey)) continue
-
-        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
-        const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
+      for (const scopedField of scopedFields) {
+        const { field, fieldPath, scope } = scopedField
         const rawValue = field?.value
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
@@ -1939,7 +1963,8 @@ async function handleCrfExtraction(req: Request, res: Response) {
     }
 
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>
-    const mode = String(body.mode || 'incremental').trim() || 'incremental'
+    const rawMode = String(body.mode || 'incremental').trim().toLowerCase()
+    const mode = rawMode === 'full' ? 'full' : 'incremental'
     const targetGroups = normalizeStringList(body.target_groups)
     const { schemaJson, fieldGroups } = getProjectTemplateMeta(proj.schema_id)
     const { targetSections, unresolved } = resolveTargetSections(targetGroups, schemaJson, fieldGroups)
@@ -1955,6 +1980,22 @@ async function handleCrfExtraction(req: Request, res: Response) {
 
     if (Array.isArray(body.patient_ids) && body.patient_ids.length > 0) {
       targetPatients = normalizeStringList(body.patient_ids)
+      if (targetPatients.length > 0) {
+        const enrolledRows = db.prepare(`
+          SELECT patient_id FROM project_patients
+          WHERE project_id = ? AND patient_id IN (${targetPatients.map(() => '?').join(',')})
+        `).all(projectId, ...targetPatients) as Array<{ patient_id: string }>
+        const enrolledSet = new Set(enrolledRows.map((row) => row.patient_id))
+        const invalidPatientIds = targetPatients.filter((patientId) => !enrolledSet.has(patientId))
+        if (invalidPatientIds.length > 0) {
+          return res.status(400).json({
+            success: false,
+            code: 400,
+            message: '部分患者未入组该项目，不能提交项目 CRF 抽取',
+            data: { invalid_patient_ids: invalidPatientIds },
+          })
+        }
+      }
     } else {
       const rows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
       targetPatients = normalizeStringList(rows.map((r) => r.patient_id))
@@ -1979,8 +2020,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2053,6 +2092,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
     }
+
+    const clearedHistory = shouldClearProjectCrfHistory({ mode, targetSections, submittedPatientIds })
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     db.prepare(`
       INSERT INTO project_extraction_tasks (
