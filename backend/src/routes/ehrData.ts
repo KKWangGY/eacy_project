@@ -805,11 +805,37 @@ router.post('/:patientId/merge-ehr', (req: Request, res: Response) => {
     }
 
     // 1. 获取文档的 extract_result_json
-    const doc = db.prepare(`SELECT extract_result_json FROM documents WHERE id = ?`).get(document_id) as any
+    const doc = db.prepare(`
+      SELECT extract_result_json, patient_id
+      FROM documents
+      WHERE id = ? AND status != 'deleted'
+    `).get(document_id) as any
     if (!doc?.extract_result_json) {
       return res.status(400).json({
         success: false, code: 400,
         message: '该文档无可合并的抽取结果',
+        data: null
+      })
+    }
+    if (!doc.patient_id || String(doc.patient_id) !== patientId) {
+      return res.status(404).json({
+        success: false, code: 404,
+        message: '该患者下不存在此文档',
+        data: null
+      })
+    }
+
+    const newPipelineRun = db.prepare(`
+      SELECT 1 FROM extraction_runs WHERE document_id = ? LIMIT 1
+    `).get(document_id) as any
+    const newPipelineCandidate = db.prepare(`
+      SELECT 1 FROM field_value_candidates WHERE source_document_id = ? LIMIT 1
+    `).get(document_id) as any
+    if (newPipelineRun || newPipelineCandidate) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '该文档已由结构化抽取管线处理，请在候选值中选择采用，避免覆盖已物化数据',
         data: null
       })
     }
@@ -1036,22 +1062,16 @@ interface PageSize {
 
 interface PageSizeFallback {
   byDocPage: Map<string, PageSize>
-  globalAny: PageSize | null
 }
 
 /**
- * 收集 rows 中已知的 OCR 原图尺寸，按 (source_document_id, source_page) 建立查找表，
- * 同时记录任意一份"已知尺寸"作为兜底。
+ * 收集 rows 中已知的 OCR 原图尺寸，按 (source_document_id, source_page) 建立查找表。
  *
  * 用于回填仅存裸 bbox（page_width/page_height 缺失）的老候选数据：
- *   1) 优先用同一 (doc_id, page) 下其它候选的尺寸；
- *   2) 同文档没有可用尺寸时，回落到本次请求范围内任意已知尺寸。
- *      这是因为前端常在同一字段下混展多个文档候选，只要有一个候选携带了
- *      原图尺寸，前端就能正确缩放（同 PDF 同 OCR 提供商，分辨率几乎一致）。
+ *   仅使用同一 (doc_id, page) 下其它候选的尺寸，避免跨文档套用不同 OCR 图像尺寸。
  */
 function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
   const byDocPage = new Map<string, PageSize>()
-  let globalAny: PageSize | null = null
   for (const r of rows) {
     if (!r?.source_bbox_json) continue
     const loc = parseSourceLocation(r.source_bbox_json, r.source_page) as any
@@ -1068,10 +1088,9 @@ function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
         const key = `${r.source_document_id}:${r.source_page ?? ''}`
         if (!byDocPage.has(key)) byDocPage.set(key, { page_width: pw, page_height: ph })
       }
-      if (!globalAny) globalAny = { page_width: pw, page_height: ph }
     }
   }
-  return { byDocPage, globalAny }
+  return { byDocPage }
 }
 
 /**
@@ -1092,9 +1111,6 @@ function parseSourceLocationWithFallback(
   if (docId) {
     const fb = fallback.byDocPage.get(`${docId}:${page ?? ''}`)
     if (fb) return { ...loc, page_width: fb.page_width, page_height: fb.page_height }
-  }
-  if (fallback.globalAny) {
-    return { ...loc, page_width: fallback.globalAny.page_width, page_height: fallback.globalAny.page_height }
   }
   return loc
 }

@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express'
 import { randomUUID } from 'crypto'
 import db from '../db.js'
 import { crfServiceSubmitBatch } from '../services/crfServiceClient.js'
+import { shouldClearProjectCrfHistory } from '../utils/projectExtractionPolicy.js'
 
 const router = Router()
 
@@ -69,6 +70,14 @@ function parseJsonArray(raw: unknown): any[] {
 function normalizeStringList(values: unknown): string[] {
   if (!Array.isArray(values)) return []
   return [...new Set(values.map((item) => String(item ?? '').trim()).filter(Boolean))]
+}
+
+/**
+ * 获取项目中已入组的患者 ID，作为批量抽取请求的唯一授权范围。
+ */
+function getProjectPatientIds(projectId: string): string[] {
+  const rows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
+  return normalizeStringList(rows.map((r) => r.patient_id))
 }
 
 function normalizeSourceList(value: unknown): string[] {
@@ -1952,12 +1961,22 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
     let targetPatients: string[] = []
+    const enrolledPatientIds = getProjectPatientIds(projectId)
+    const enrolledPatientSet = new Set(enrolledPatientIds)
 
     if (Array.isArray(body.patient_ids) && body.patient_ids.length > 0) {
       targetPatients = normalizeStringList(body.patient_ids)
+      const nonEnrolledPatientIds = targetPatients.filter((patientId) => !enrolledPatientSet.has(patientId))
+      if (nonEnrolledPatientIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          code: 400,
+          message: '请求包含未入组该项目的患者',
+          data: { non_enrolled_patient_ids: nonEnrolledPatientIds },
+        })
+      }
     } else {
-      const rows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
-      targetPatients = normalizeStringList(rows.map((r) => r.patient_id))
+      targetPatients = enrolledPatientIds
     }
 
     if (targetPatients.length === 0) {
@@ -1979,8 +1998,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2053,6 +2070,10 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
     }
+
+    const clearedHistory = shouldClearProjectCrfHistory(mode, targetGroups, targetSections) && submittedPatientIds.length > 0
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     db.prepare(`
       INSERT INTO project_extraction_tasks (
