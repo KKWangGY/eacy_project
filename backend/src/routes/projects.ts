@@ -71,6 +71,24 @@ function normalizeStringList(values: unknown): string[] {
   return [...new Set(values.map((item) => String(item ?? '').trim()).filter(Boolean))]
 }
 
+/**
+ * 归一化项目 CRF 抽取模式，未知值按增量处理，避免误触发破坏性全量清理。
+ */
+export function normalizeExtractionMode(rawMode: unknown): 'full' | 'incremental' {
+  const mode = String(rawMode || 'incremental').trim().toLowerCase()
+  return mode === 'full' ? 'full' : 'incremental'
+}
+
+/**
+ * 判断本次抽取是否允许清空既有 Project CRF 历史。
+ *
+ * 只有明确的全量、非靶向抽取才需要先清历史；增量或靶向补抽必须保留既有字段，
+ * 否则 CRF 服务不可用、患者无文档或仅抽取某个表单时会造成已保存 CRF 数据丢失。
+ */
+export function shouldClearProjectCrfHistory(mode: unknown, targetGroups: unknown): boolean {
+  return normalizeExtractionMode(mode) === 'full' && normalizeStringList(targetGroups).length === 0
+}
+
 function normalizeSourceList(value: unknown): string[] {
   if (value == null) return []
   if (typeof value === 'string') return value.trim() ? [value.trim()] : []
@@ -1939,7 +1957,7 @@ async function handleCrfExtraction(req: Request, res: Response) {
     }
 
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>
-    const mode = String(body.mode || 'incremental').trim() || 'incremental'
+    const mode = normalizeExtractionMode(body.mode)
     const targetGroups = normalizeStringList(body.target_groups)
     const { schemaJson, fieldGroups } = getProjectTemplateMeta(proj.schema_id)
     const { targetSections, unresolved } = resolveTargetSections(targetGroups, schemaJson, fieldGroups)
@@ -1951,13 +1969,24 @@ async function handleCrfExtraction(req: Request, res: Response) {
         data: { target_groups: targetGroups, unresolved_target_groups: unresolved },
       })
     }
+    const enrolledRows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
+    const enrolledPatients = normalizeStringList(enrolledRows.map((r) => r.patient_id))
     let targetPatients: string[] = []
 
     if (Array.isArray(body.patient_ids) && body.patient_ids.length > 0) {
       targetPatients = normalizeStringList(body.patient_ids)
+      const enrolledSet = new Set(enrolledPatients)
+      const unEnrolledPatients = targetPatients.filter((patientId) => !enrolledSet.has(patientId))
+      if (unEnrolledPatients.length > 0) {
+        return res.status(400).json({
+          success: false,
+          code: 400,
+          message: '请求包含未入组该项目的患者',
+          data: { un_enrolled_patient_ids: unEnrolledPatients },
+        })
+      }
     } else {
-      const rows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
-      targetPatients = normalizeStringList(rows.map((r) => r.patient_id))
+      targetPatients = enrolledPatients
     }
 
     if (targetPatients.length === 0) {
@@ -1979,8 +2008,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2054,6 +2081,17 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedDocumentIds.push(...docIds)
     }
 
+    let clearedHistory = { cleared_patient_count: 0, cleared_instance_count: 0 }
+    const summaryPayload = {
+      requested_patient_count: targetPatients.length,
+      submitted_patient_count: submittedPatientIds.length,
+      submitted_document_count: submittedDocumentIds.length,
+      target_sections: targetSections,
+      unresolved_target_groups: unresolved,
+      cleared_history: clearedHistory,
+      skipped_patients: skippedPatients,
+    }
+
     db.prepare(`
       INSERT INTO project_extraction_tasks (
         id, project_id, schema_id, status, mode, target_groups_json, patient_ids_json,
@@ -2069,19 +2107,21 @@ async function handleCrfExtraction(req: Request, res: Response) {
       JSON.stringify(submittedPatientIds),
       JSON.stringify(submittedJobIds),
       JSON.stringify(submittedDocumentIds),
-      JSON.stringify({
-        requested_patient_count: targetPatients.length,
-        submitted_patient_count: submittedPatientIds.length,
-        submitted_document_count: submittedDocumentIds.length,
-        target_sections: targetSections,
-        unresolved_target_groups: unresolved,
-        cleared_history: clearedHistory,
-        skipped_patients: skippedPatients,
-      }),
+      JSON.stringify(summaryPayload),
       startedAt,
       startedAt,
       startedAt
     )
+
+    if (shouldClearProjectCrfHistory(mode, targetGroups)) {
+      clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      summaryPayload.cleared_history = clearedHistory
+      db.prepare(`
+        UPDATE project_extraction_tasks
+        SET summary_json = ?, updated_at = ?
+        WHERE id = ?
+      `).run(JSON.stringify(summaryPayload), nowIso(), taskId)
+    }
 
     const task = persistProjectTaskSummary(summarizeProjectTask(getLatestProjectExtractionTask(projectId)))
 
