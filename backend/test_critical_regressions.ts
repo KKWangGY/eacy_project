@@ -48,8 +48,8 @@ function testPdfPageSizeFallbackScope() {
     'doc-b',
     fallback
   ) as any
-  assert.equal(otherDoc.page_width, undefined)
-  assert.equal(otherDoc.page_height, undefined)
+  assert.equal(otherDoc.page_width, null)
+  assert.equal(otherDoc.page_height, null)
 
   const otherPage = parseSourceLocationWithFallback(
     JSON.stringify({ bbox: [11, 22, 33, 44] }),
@@ -57,8 +57,8 @@ function testPdfPageSizeFallbackScope() {
     'doc-a',
     fallback
   ) as any
-  assert.equal(otherPage.page_width, undefined)
-  assert.equal(otherPage.page_height, undefined)
+  assert.equal(otherPage.page_width, null)
+  assert.equal(otherPage.page_height, null)
 }
 
 testProjectCrfClearPolicy()
