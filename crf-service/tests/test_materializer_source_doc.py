@@ -84,6 +84,84 @@ def test_per_doc_payload_does_not_cross_contaminate(repo, seed_basic):
     assert json.loads(by_doc["doc_b"]["value_json"]) == "高血压"
 
 
+def test_repeatable_top_level_list_keeps_each_extracted_item(repo, seed_basic):
+    """
+    场景：LLM 对可重复 section 一次返回多条数组元素，且 schema 未配置 anchor。
+    预期：每个数组元素都物化为独立 section_instance，selected 层保留每一条值。
+    回归：按 source_document_id 查找旧 section 会让同一批 list 元素复用第一条 section，
+    导致 field_value_selected 中后一条覆盖前一条，前端只看到最后一条。
+    """
+    materializer = Materializer(repo)
+    schema_content = {
+        "type": "object",
+        "properties": {
+            "入院诊断": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "主要诊断": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+    payload = {
+        "task_results": [
+            {
+                "path": ["入院诊断"],
+                "extracted": [
+                    {"主要诊断": "诊断A"},
+                    {"主要诊断": "诊断B"},
+                ],
+                "audit": {"fields": {}},
+            }
+        ]
+    }
+
+    with repo.connect() as conn:
+        conn.execute(
+            "UPDATE schemas SET content_json = ? WHERE id = ?",
+            (json.dumps(schema_content, ensure_ascii=False), seed_basic["schema_id"]),
+        )
+        materializer.materialize(
+            conn=conn,
+            patient_id=seed_basic["patient_id"],
+            document_id="doc_a",
+            schema_id=seed_basic["schema_id"],
+            extract_payload=payload,
+        )
+        conn.commit()
+
+        sections = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, repeat_index
+                FROM section_instances
+                WHERE section_path = '/入院诊断'
+                ORDER BY repeat_index
+                """
+            ).fetchall()
+        ]
+        selected = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT section_instance_id, field_path, selected_value_json
+                FROM field_value_selected
+                WHERE field_path = '/入院诊断/主要诊断'
+                ORDER BY section_instance_id
+                """
+            ).fetchall()
+        ]
+
+    assert [row["repeat_index"] for row in sections] == [0, 1]
+    assert len(selected) == 2
+    assert {json.loads(row["selected_value_json"]) for row in selected} == {"诊断A", "诊断B"}
+    assert {row["section_instance_id"] for row in selected} == {row["id"] for row in sections}
+
+
 def test_ai_overwrites_previous_ai_but_keeps_user_edits(repo, seed_basic):
     """
     场景：
