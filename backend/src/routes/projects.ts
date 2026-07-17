@@ -683,6 +683,16 @@ function clearProjectCrfHistoryForPatients(projectId: string, schemaId: string, 
   }
 }
 
+/**
+ * 判断本次项目 CRF 抽取是否允许重置既有物化结果。
+ *
+ * 只有用户显式请求完整重抽时才清理历史；默认 incremental 和字段组靶向抽取必须保留
+ * 已确认值、候选历史与可重复 section/row 实例，避免“补抽缺失字段”误删既有 CRF 数据。
+ */
+function shouldClearProjectCrfHistory(mode: string, targetSections: string[]) {
+  return String(mode || '').trim().toLowerCase() === 'full' && targetSections.length === 0
+}
+
 function summarizeProjectTask(taskRow: any) {
   if (!taskRow) return null
   const jobIds = normalizeStringList(parseJsonArray(taskRow.job_ids_json))
@@ -1955,6 +1965,17 @@ async function handleCrfExtraction(req: Request, res: Response) {
 
     if (Array.isArray(body.patient_ids) && body.patient_ids.length > 0) {
       targetPatients = normalizeStringList(body.patient_ids)
+      const enrolledRows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
+      const enrolledSet = new Set(normalizeStringList(enrolledRows.map((r) => r.patient_id)))
+      const invalidPatientIds = targetPatients.filter((patientId) => !enrolledSet.has(patientId))
+      if (invalidPatientIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          code: 400,
+          message: '部分患者不属于该项目，无法提交科研抽取',
+          data: { invalid_patient_ids: invalidPatientIds },
+        })
+      }
     } else {
       const rows = db.prepare(`SELECT patient_id FROM project_patients WHERE project_id = ?`).all(projectId) as any[]
       targetPatients = normalizeStringList(rows.map((r) => r.patient_id))
@@ -1980,30 +2001,37 @@ async function handleCrfExtraction(req: Request, res: Response) {
       })
     }
 
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
-
     const stmtDocs = db.prepare(`
       SELECT id
       FROM documents
       WHERE patient_id = ? AND status != 'deleted' AND status IN ('ocr_succeeded', 'archived')
       ORDER BY created_at ASC
     `)
+    const patientDocumentMap = new Map<string, string[]>()
+    const skippedPatients: any[] = []
+    for (const patientId of targetPatients) {
+      const docRows = stmtDocs.all(patientId) as any[]
+      const docIds = normalizeStringList(docRows.map((r) => r.id))
+      if (docIds.length === 0) {
+        skippedPatients.push({ patient_id: patientId, reason: 'no_documents' })
+        continue
+      }
+      patientDocumentMap.set(patientId, docIds)
+    }
+
+    const patientsToSubmit = targetPatients.filter((patientId) => patientDocumentMap.has(patientId))
+    const clearedHistory = shouldClearProjectCrfHistory(mode, targetSections)
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, patientsToSubmit)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
+
     const taskId = randomUUID()
     const startedAt = nowIso()
     const submittedJobIds: string[] = []
     const submittedDocumentIds: string[] = []
     const submittedPatientIds: string[] = []
-    const skippedPatients: any[] = []
 
-    for (const patientId of targetPatients) {
-      const docRows = stmtDocs.all(patientId) as any[]
-      const docIds = normalizeStringList(docRows.map((r) => r.id))
-
-      if (docIds.length === 0) {
-        skippedPatients.push({ patient_id: patientId, reason: 'no_documents' })
-        continue
-      }
-
+    for (const patientId of patientsToSubmit) {
+      const docIds = patientDocumentMap.get(patientId) || []
       const sectionsToSubmit = targetSections.length > 0 ? targetSections : [null]
       const jobIds: string[] = []
 
