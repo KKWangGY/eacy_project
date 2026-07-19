@@ -1712,7 +1712,16 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
     })
   }
 
-  const patientId = req.body.patient_id || row.patient_id;
+  const requestedPatientId = String(req.body?.patient_id || '').trim()
+  const patientId = row.patient_id ? String(row.patient_id).trim() : ''
+  if (requestedPatientId && requestedPatientId !== patientId) {
+    return res.status(400).json({
+      success: false,
+      code: 400,
+      message: '请求的 patient_id 与文档绑定患者不一致',
+      data: { document_id: String(req.params.id) },
+    })
+  }
   if (!patientId) {
     return res.status(400).json({ success: false, code: 400, message: '无可用的 patient_id 绑定', data: null })
   }
@@ -1720,7 +1729,16 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
   const meta = safeParseMetadata(row.metadata)
   let requestedProjectId = String(req.body.project_id || meta.project_id || '').trim() || null
   let schemaId = req.body.schema_id || null
-  let instanceType = req.body.instance_type || null
+  let instanceType = String(req.body.instance_type || '').trim() || null
+
+  if (instanceType === 'project_crf' && !requestedProjectId) {
+    return res.status(400).json({
+      success: false,
+      code: 400,
+      message: '科研 CRF 抽取必须指定 project_id',
+      data: null,
+    })
+  }
 
   if (requestedProjectId) {
     const proj = db.prepare(`SELECT schema_id FROM projects WHERE id = ?`).get(requestedProjectId) as { schema_id?: string } | undefined
@@ -1732,7 +1750,29 @@ router.post('/:id/extract-ehr', async (req: Request, res: Response) => {
         data: { project_id: requestedProjectId },
       })
     }
-    schemaId = schemaId || proj.schema_id
+    if (schemaId && schemaId !== proj.schema_id) {
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '请求的 schema_id 与项目绑定 CRF 模板不一致',
+        data: { project_id: requestedProjectId },
+      })
+    }
+    const enrollment = db.prepare(`
+      SELECT 1
+      FROM project_patients
+      WHERE project_id = ? AND patient_id = ?
+      LIMIT 1
+    `).get(requestedProjectId, patientId) as { 1: number } | undefined
+    if (!enrollment) {
+      return res.status(403).json({
+        success: false,
+        code: 403,
+        message: '文档绑定患者未加入该项目，无法进行科研 CRF 抽取',
+        data: { project_id: requestedProjectId, patient_id: patientId },
+      })
+    }
+    schemaId = proj.schema_id
     instanceType = instanceType || 'project_crf'
   }
 

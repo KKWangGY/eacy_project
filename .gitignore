@@ -54,6 +54,11 @@ test_files/
 *.log
 *.sqlite
 *.sqlite3
+*.db
+*.db-*
+*.db.*
+backend/uploads/
+crf-service/logs/
 celerybeat-schedule
 celerybeat.pid
 

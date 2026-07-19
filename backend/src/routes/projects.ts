@@ -1964,6 +1964,22 @@ async function handleCrfExtraction(req: Request, res: Response) {
       return res.status(400).json({ success: false, code: 400, message: '该项目下无可用的患者进行抽取', data: null })
     }
 
+    const enrolledRows = db.prepare(`
+      SELECT patient_id
+      FROM project_patients
+      WHERE project_id = ?
+    `).all(projectId) as Array<{ patient_id: string }>
+    const enrolledPatientIds = new Set(normalizeStringList(enrolledRows.map((row) => row.patient_id)))
+    const invalidPatientIds = targetPatients.filter((patientId) => !enrolledPatientIds.has(patientId))
+    if (invalidPatientIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        code: 400,
+        message: '请求中包含未加入该项目的患者',
+        data: { invalid_patient_ids: invalidPatientIds },
+      })
+    }
+
     const conflictingTask = findActiveTaskForPatients(projectId, targetPatients)
     if (conflictingTask) {
       const conflictingPatients = normalizeStringList(conflictingTask.patient_ids)
@@ -1979,8 +1995,6 @@ async function handleCrfExtraction(req: Request, res: Response) {
         },
       })
     }
-
-    const clearedHistory = clearProjectCrfHistoryForPatients(projectId, proj.schema_id, targetPatients)
 
     const stmtDocs = db.prepare(`
       SELECT id
@@ -2053,6 +2067,11 @@ async function handleCrfExtraction(req: Request, res: Response) {
       submittedJobIds.push(...jobIds)
       submittedDocumentIds.push(...docIds)
     }
+
+    const shouldClearHistory = mode === 'full' && targetGroups.length === 0 && targetSections.length === 0
+    const clearedHistory = shouldClearHistory
+      ? clearProjectCrfHistoryForPatients(projectId, proj.schema_id, submittedPatientIds)
+      : { cleared_patient_count: 0, cleared_instance_count: 0 }
 
     db.prepare(`
       INSERT INTO project_extraction_tasks (
