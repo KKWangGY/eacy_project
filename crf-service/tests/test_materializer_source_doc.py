@@ -273,3 +273,73 @@ def test_instance_documents_has_unique_constraint(repo, seed_basic):
         ).fetchone()
 
     assert rows[0] == 1, f"instance_documents 应保持唯一，实际 {rows[0]} 条"
+
+
+def test_repeatable_top_level_list_keeps_each_extracted_item(repo, seed_basic):
+    """
+    场景：同一文档抽取出顶层可重复 section 的多个列表项，且 schema 未配置 anchor。
+    预期：每个列表项写入独立 section，不能复用同一文档的第一个 section 导致后项覆盖前项。
+    """
+    materializer = Materializer(repo)
+    schema_content = {
+        "type": "object",
+        "properties": {
+            "随访记录": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "日期": {"type": "string"},
+                        "结论": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+    payload = {
+        "task_results": [{
+            "path": ["随访记录"],
+            "extracted": [
+                {"日期": "2026-01-01", "结论": "稳定"},
+                {"日期": "2026-02-01", "结论": "进展"},
+            ],
+            "audit": {"fields": {}},
+        }],
+    }
+
+    with repo.connect() as conn:
+        conn.execute(
+            "UPDATE schemas SET content_json = ? WHERE id = ?",
+            (json.dumps(schema_content, ensure_ascii=False), seed_basic["schema_id"]),
+        )
+        materializer.materialize(
+            conn=conn,
+            patient_id=seed_basic["patient_id"],
+            document_id="doc_a",
+            schema_id=seed_basic["schema_id"],
+            extract_payload=payload,
+        )
+        conn.commit()
+
+        sections = conn.execute(
+            """
+            SELECT id, repeat_index
+            FROM section_instances
+            WHERE section_path = '/随访记录'
+            ORDER BY repeat_index ASC
+            """
+        ).fetchall()
+        selected = conn.execute(
+            """
+            SELECT section_instance_id, field_path, selected_value_json
+            FROM field_value_selected
+            WHERE field_path IN ('/随访记录/日期', '/随访记录/结论')
+            ORDER BY section_instance_id, field_path
+            """
+        ).fetchall()
+
+    assert [row["repeat_index"] for row in sections] == [0, 1]
+    assert len({row["section_instance_id"] for row in selected}) == 2
+    values = [json.loads(row["selected_value_json"]) for row in selected]
+    assert "稳定" in values
+    assert "进展" in values

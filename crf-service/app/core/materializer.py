@@ -229,13 +229,6 @@ class Materializer:
                             section_path=section_path,
                             anchor_key=anchor_key,
                         ) if schema_is_repeatable and anchor_key else None
-                        if schema_is_repeatable and not existing_section:
-                            existing_section = self.repo.find_section_instance_by_document(
-                                conn,
-                                instance_id=instance_id,
-                                section_path=section_path,
-                                source_document_id=document_id,
-                            )
                         repeat_index = int(existing_section["repeat_index"]) if existing_section else self.repo.next_section_repeat_index(
                             conn,
                             instance_id=instance_id,
