@@ -1036,22 +1036,17 @@ interface PageSize {
 
 interface PageSizeFallback {
   byDocPage: Map<string, PageSize>
-  globalAny: PageSize | null
 }
 
 /**
  * 收集 rows 中已知的 OCR 原图尺寸，按 (source_document_id, source_page) 建立查找表，
- * 同时记录任意一份"已知尺寸"作为兜底。
  *
  * 用于回填仅存裸 bbox（page_width/page_height 缺失）的老候选数据：
- *   1) 优先用同一 (doc_id, page) 下其它候选的尺寸；
- *   2) 同文档没有可用尺寸时，回落到本次请求范围内任意已知尺寸。
- *      这是因为前端常在同一字段下混展多个文档候选，只要有一个候选携带了
- *      原图尺寸，前端就能正确缩放（同 PDF 同 OCR 提供商，分辨率几乎一致）。
+ * 只允许使用同一 (doc_id, page) 下其它候选的尺寸，避免把另一份 PDF
+ * 的页面尺寸套用到当前候选，导致医疗证据高亮定位到错误位置。
  */
-function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
+export function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
   const byDocPage = new Map<string, PageSize>()
-  let globalAny: PageSize | null = null
   for (const r of rows) {
     if (!r?.source_bbox_json) continue
     const loc = parseSourceLocation(r.source_bbox_json, r.source_page) as any
@@ -1068,10 +1063,9 @@ function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
         const key = `${r.source_document_id}:${r.source_page ?? ''}`
         if (!byDocPage.has(key)) byDocPage.set(key, { page_width: pw, page_height: ph })
       }
-      if (!globalAny) globalAny = { page_width: pw, page_height: ph }
     }
   }
-  return { byDocPage, globalAny }
+  return { byDocPage }
 }
 
 /**
@@ -1080,7 +1074,7 @@ function buildPageSizeFallback(rows: Array<any>): PageSizeFallback {
  * 修复：旧版物化器只写了 {bbox}，前端 toRect 拿不到原图尺寸会触发坏的回退启发式
  * （把当前 bbox 的 maxX 当作图像宽度），导致 PDF 红框位置/尺寸明显偏移。
  */
-function parseSourceLocationWithFallback(
+export function parseSourceLocationWithFallback(
   raw: string | null,
   page: number | null,
   docId: string | null,
@@ -1092,9 +1086,6 @@ function parseSourceLocationWithFallback(
   if (docId) {
     const fb = fallback.byDocPage.get(`${docId}:${page ?? ''}`)
     if (fb) return { ...loc, page_width: fb.page_width, page_height: fb.page_height }
-  }
-  if (fallback.globalAny) {
-    return { ...loc, page_width: fallback.globalAny.page_width, page_height: fallback.globalAny.page_height }
   }
   return loc
 }
