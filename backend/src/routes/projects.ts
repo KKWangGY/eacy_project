@@ -1611,14 +1611,14 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       return res.json({ success: true, code: 0, message: '没有需要保存的字段', data: { changed_fields: 0 } })
     }
 
-    const requestedFieldPaths = fields
+    const requestedFieldPaths: string[] = fields
       .map((field: any) => {
         const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
         const groupId = String(field?.group_id || '').trim()
         const fieldKey = String(field?.field_key || '').trim()
         return explicitFieldPath || (groupId && fieldKey ? `${groupId}/${fieldKey}` : '')
       })
-      .filter(Boolean)
+      .filter((path: string) => path.length > 0)
 
     // 查找或创建 project_crf schema_instance
     let instance = db.prepare(`
