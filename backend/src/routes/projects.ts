@@ -1611,6 +1611,15 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
       return res.json({ success: true, code: 0, message: '没有需要保存的字段', data: { changed_fields: 0 } })
     }
 
+    const requestedFieldPaths = fields
+      .map((field: any) => {
+        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+        const groupId = String(field?.group_id || '').trim()
+        const fieldKey = String(field?.field_key || '').trim()
+        return explicitFieldPath || (groupId && fieldKey ? `${groupId}/${fieldKey}` : '')
+      })
+      .filter(Boolean)
+
     // 查找或创建 project_crf schema_instance
     let instance = db.prepare(`
       SELECT id FROM schema_instances
@@ -1620,6 +1629,17 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
     let instanceId: string
     if (!instance) {
+      const unresolvedPaths = requestedFieldPaths.filter((path) =>
+        normalizeProjectFieldPath(path).split('/').filter(Boolean).some((segment) => /^\d+$/.test(segment))
+      )
+      if (unresolvedPaths.length > 0) {
+        return res.status(409).json({
+          success: false,
+          code: 409,
+          message: '部分字段所在的重复行已不存在，请刷新后重试',
+          data: { unresolved_paths: unresolvedPaths },
+        })
+      }
       instanceId = randomUUID()
       db.prepare(`
         INSERT INTO schema_instances (id, patient_id, schema_id, project_id, name, instance_type, status)
@@ -1669,19 +1689,41 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
 
     const updatedAt = new Date().toISOString()
     let changedCount = 0
+    const saveFields: Array<{
+      fieldPath: string
+      scope: ReturnType<typeof resolveProjectFieldScope>
+      rawValue: any
+    }> = []
+    const unresolvedPaths: string[] = []
+
+    for (const field of fields) {
+      const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
+      const groupId = String(field?.group_id || '').trim()
+      const fieldKey = String(field?.field_key || '').trim()
+      if (!explicitFieldPath && (!groupId || !fieldKey)) continue
+
+      const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
+      const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
+      const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
+      if (!scope.resolved) {
+        unresolvedPaths.push(requestedFieldPath)
+        continue
+      }
+      saveFields.push({ fieldPath, scope, rawValue: field?.value })
+    }
+
+    if (unresolvedPaths.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 409,
+        message: '部分字段所在的重复行已不存在，请刷新后重试',
+        data: { unresolved_paths: unresolvedPaths },
+      })
+    }
 
     const saveAll = db.transaction(() => {
-      for (const field of fields) {
-        const explicitFieldPath = String(field?.field_path || field?.path || '').trim()
-        const groupId = String(field?.group_id || '').trim()
-        const fieldKey = String(field?.field_key || '').trim()
-        if (!explicitFieldPath && (!groupId || !fieldKey)) continue
-
-        const requestedFieldPath = explicitFieldPath || `${groupId}/${fieldKey}`
-        const fieldPath = stripProjectFieldPathIndices(requestedFieldPath)
-        const scope = resolveProjectFieldScope(instanceId, requestedFieldPath)
-        if (!scope.resolved) continue
-        const rawValue = field?.value
+      for (const field of saveFields) {
+        const rawValue = field.rawValue
         const valueJson = rawValue === null || rawValue === undefined
           ? 'null'
           : JSON.stringify(rawValue)
@@ -1697,20 +1739,20 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
             AND COALESCE(section_instance_id, '__null__') = COALESCE(?, '__null__')
             AND COALESCE(row_instance_id, '__null__') = COALESCE(?, '__null__')
             AND field_path = ?
-        `).get(instanceId, scope.sectionInstanceId, scope.rowInstanceId, fieldPath) as { selected_value_json: string } | undefined
+        `).get(instanceId, field.scope.sectionInstanceId, field.scope.rowInstanceId, field.fieldPath) as { selected_value_json: string } | undefined
         if (existing && existing.selected_value_json === valueJson) {
           continue
         }
 
         // 写入候选值
         const candidateId = randomUUID()
-        if (scope.sectionInstanceId || scope.rowInstanceId) {
+        if (field.scope.sectionInstanceId || field.scope.rowInstanceId) {
           insertScopedCandidate.run(
             candidateId,
             instanceId,
-            scope.sectionInstanceId,
-            scope.rowInstanceId,
-            fieldPath,
+            field.scope.sectionInstanceId,
+            field.scope.rowInstanceId,
+            field.fieldPath,
             valueJson,
             valueType,
             '用户手动编辑',
@@ -1720,7 +1762,7 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
           insertCandidate.run(
             candidateId,
             instanceId,
-            fieldPath,
+            field.fieldPath,
             valueJson,
             valueType,
             '用户手动编辑',
@@ -1729,18 +1771,18 @@ router.patch('/:projectId/patients/:patientId/crf/fields', (req: Request, res: R
         }
 
         // 写入选中值
-        if (scope.sectionInstanceId || scope.rowInstanceId) {
+        if (field.scope.sectionInstanceId || field.scope.rowInstanceId) {
           upsertScopedSelected.run(
             randomUUID(),
             instanceId,
-            scope.sectionInstanceId,
-            scope.rowInstanceId,
-            fieldPath,
+            field.scope.sectionInstanceId,
+            field.scope.rowInstanceId,
+            field.fieldPath,
             candidateId,
             valueJson
           )
         } else {
-          upsertSelected.run(randomUUID(), instanceId, fieldPath, candidateId, valueJson)
+          upsertSelected.run(randomUUID(), instanceId, field.fieldPath, candidateId, valueJson)
         }
         changedCount++
       }
